@@ -1,22 +1,46 @@
 import argparse
+import io
+import itertools
 import json
 from pathlib import Path
+
+from PIL import Image
 
 from selectground import SelectGround
 
 
 def load_cases(name: str, root: Path):
     if name == "screenspot_pro":
-        for annotation in sorted((root / "annotations").glob("*.json")):
-            for row in json.loads(annotation.read_text()):
-                yield {
-                    "id": row["id"],
-                    "image": root / "images" / row["img_filename"],
-                    "instruction": row["instruction"],
-                    "target": row["bbox"],
-                    "type": "xyxy",
-                    "group": row.get("group"),
-                }
+        parquet_files = sorted((root / "data").glob("*.parquet"))
+        if parquet_files:
+            import pyarrow.parquet as parquet
+
+            for path in parquet_files:
+                for batch in parquet.ParquetFile(path).iter_batches(batch_size=1):
+                    row = batch.to_pylist()[0]
+                    encoded = row["image"]
+                    image = Image.open(io.BytesIO(encoded["bytes"])).convert("RGB")
+                    yield {
+                        "id": row["id"],
+                        "image": image,
+                        "image_name": encoded.get("path") or row["id"],
+                        "instruction": row["instruction"],
+                        "target": row["bbox"],
+                        "type": "xyxy",
+                        "group": row.get("group"),
+                    }
+        else:
+            for annotation in sorted((root / "annotations").glob("*.json")):
+                for row in json.loads(annotation.read_text()):
+                    yield {
+                        "id": row["id"],
+                        "image": root / "images" / row["img_filename"],
+                        "image_name": row["img_filename"],
+                        "instruction": row["instruction"],
+                        "target": row["bbox"],
+                        "type": "xyxy",
+                        "group": row.get("group"),
+                    }
     elif name == "ui_vision":
         for split in ("basic", "functional", "spatial"):
             path = root / "annotations" / "element_grounding" / f"element_grounding_{split}.json"
@@ -24,6 +48,7 @@ def load_cases(name: str, root: Path):
                 yield {
                     "id": f"{split}-{index}",
                     "image": root / "images" / row["image_path"],
+                    "image_name": row["image_path"],
                     "instruction": row["prompt_to_evaluate"],
                     "target": row["bbox"],
                     "type": "xyxy",
@@ -37,6 +62,7 @@ def load_cases(name: str, root: Path):
             yield {
                 "id": row["id"],
                 "image": benchmark / "images" / row["image_path"],
+                "image_name": row["image_path"],
                 "instruction": row["instruction"],
                 "target": row["box_coordinates"],
                 "type": row["box_type"],
@@ -54,7 +80,12 @@ def contains(point, target, target_type):
         else:
             left, top, width, height = target[:4]
             right, bottom = left + width, top + height
-        return left <= x <= right and top <= y <= bottom
+        center_x, center_y = (left + right) / 2, (top + bottom) / 2
+        half_width, half_height = abs(right - left) / 2, abs(bottom - top) / 2
+        return (
+            center_x - half_width <= x <= center_x + half_width
+            and center_y - half_height <= y <= center_y + half_height
+        )
     vertices = list(zip(target[0::2], target[1::2]))
     previous, inside = vertices[-1], False
     for current in vertices:
@@ -86,9 +117,16 @@ parser.add_argument("--data", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--conground", action="store_true")
 parser.add_argument("--limit", type=int)
+parser.add_argument("--num-shards", type=int, default=1)
+parser.add_argument("--shard", type=int, default=0)
 args = parser.parse_args()
 
-cases = list(load_cases(args.benchmark, args.data))[: args.limit]
+cases = (
+    case for index, case in enumerate(load_cases(args.benchmark, args.data))
+    if index % args.num_shards == args.shard
+)
+if args.limit is not None:
+    cases = itertools.islice(cases, args.limit)
 existing = []
 if args.output.exists():
     existing = [json.loads(line) for line in args.output.read_text().splitlines() if line.strip()]
@@ -103,7 +141,7 @@ with args.output.open("a") as output:
         row = {
             "id": case["id"],
             "instruction": case["instruction"],
-            "image": str(case["image"]),
+            "image": case["image_name"],
             "point": prediction["point"],
             "correct": contains(prediction["point"], case["target"], case["type"]),
             "group": case["group"],
@@ -112,5 +150,5 @@ with args.output.open("a") as output:
         output.write(json.dumps(row) + "\n")
         output.flush()
         existing.append(row)
-        print(f"[{number}/{len(cases)}] {case['id']} correct={int(row['correct'])}", flush=True)
+        print(f"[{number}] {case['id']} correct={int(row['correct'])}", flush=True)
 print(json.dumps(metrics(existing, args.benchmark), indent=2))

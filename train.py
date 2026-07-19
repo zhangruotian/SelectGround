@@ -16,7 +16,7 @@ from huggingface_hub import snapshot_download
 from peft import LoraConfig, get_peft_model
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForImageTextToText, AutoProcessor, get_scheduler
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, get_scheduler
 
 from selectground import PROMPT, _attention_logits, _find_config, _value
 
@@ -255,7 +255,8 @@ def main() -> None:
     if accelerator.num_processes != recipe["gpus"]:
         raise ValueError(f"{args.model} training requires {recipe['gpus']} processes")
     set_seed(SEED + accelerator.process_index)
-    data = Path(snapshot_download(recipe["data"], repo_type="dataset"))
+    with accelerator.main_process_first():
+        data = Path(snapshot_download(recipe["data"], repo_type="dataset"))
     pairs = read_rows(data / "data" / "train_pairs.jsonl")
     random.Random(SEED).shuffle(pairs)
     pairs = pairs[max(1, round(.02 * len(pairs))) :]
@@ -268,8 +269,10 @@ def main() -> None:
     processor = AutoProcessor.from_pretrained(
         recipe["base"], revision=recipe["revision"], min_pixels=3136, max_pixels=8847360
     )
+    base_config = AutoConfig.from_pretrained(recipe["base"], revision=recipe["revision"])
     model = AutoModelForImageTextToText.from_pretrained(
-        recipe["base"], revision=recipe["revision"], dtype=torch.bfloat16, attn_implementation="sdpa"
+        recipe["base"], revision=recipe["revision"], config=base_config,
+        dtype=torch.bfloat16, attn_implementation="sdpa"
     )
     model = get_peft_model(model, LoraConfig(
         r=64,
@@ -295,6 +298,8 @@ def main() -> None:
     model, selector, optimizer, pair_loader, replay_loader = accelerator.prepare(
         model, selector, optimizer, pair_loader, replay_loader
     )
+    model.train()
+    selector.train()
     if args.model == "8b":
         refine_pairs, refine_replay = accelerator.prepare(refine_pairs, refine_replay)
     iterators = [iter(pair_loader), iter(replay_loader)]

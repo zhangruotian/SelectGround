@@ -58,9 +58,10 @@ Use `ruotian/SelectGround-30B-A3B` for the 30B-A3B checkpoint. The returned `poi
 Download the official releases:
 
 ```bash
-hf download lscpku/ScreenSpot-Pro --repo-type dataset --local-dir data/screenspot-pro
-hf download ServiceNow/ui-vision --repo-type dataset --local-dir data/ui-vision
+hf download lscpku/ScreenSpot-Pro --repo-type dataset --revision 211c2a6b5214b4dc8555a639a47575a9abd48c99 --local-dir data/screenspot-pro
+hf download ServiceNow/ui-vision --repo-type dataset --revision 766c66aeffef16608d4916525902d9fb2598d7ce --local-dir data/ui-vision
 git clone https://github.com/xlang-ai/OSWorld-G.git data/OSWorld-G
+git -C data/OSWorld-G checkout daa6bd8e0e629f0917ad2984df930bf0bd967540
 ```
 
 Run direct inference or append `--conground`:
@@ -79,11 +80,11 @@ Official benchmark pages: [ScreenSpot-Pro](https://huggingface.co/datasets/lscpk
 
 The released [SelectGround-Data](https://huggingface.co/datasets/ruotian/SelectGround-Data) contains the exact screenshots and annotations used by both fixed recipes: 3,790 target–distractor pairs and 3,790 replay examples. The 8B recipe additionally uses the included 502-pair final refinement set with 502 matched replay examples.
 
-The fixed recipes use two GPUs for 8B and four 80 GB GPUs for 30B-A3B:
+The fixed recipes use two 48 GB GPUs for 8B and four 80 GB GPUs for 30B-A3B:
 
 ```bash
-accelerate launch --num_processes 2 train.py --model 8b --output outputs/SelectGround-8B
-accelerate launch --num_processes 4 train.py --model 30b --output outputs/SelectGround-30B-A3B
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --mixed_precision bf16 --num_processes 2 train.py --model 8b --output outputs/SelectGround-8B
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --mixed_precision bf16 --num_processes 4 train.py --model 30b --output outputs/SelectGround-30B-A3B
 ```
 
 Training is standard LoRA SFT. On mined examples, the loss additionally ranks the target region above the verified distractor and three hard UI regions. The training-only head aggregation is saved as `selection_head.pt`; inference uses only the trained grounding model.

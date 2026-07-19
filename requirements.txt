@@ -1,9 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
 accelerate==1.13.0
 huggingface-hub==0.36.2
 peft==0.19.1
 Pillow==12.2.0
+pyarrow==24.0.0
 qwen-vl-utils==0.0.14
 safetensors==0.7.0
-torch==2.11.0
-torchvision==0.26.0
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
 transformers==4.57.1
