@@ -106,8 +106,9 @@ def metrics(rows, benchmark):
     splits = {}
     for split in ("basic", "functional", "spatial"):
         selected = [row for row in rows if row["group"] == split]
-        splits[split] = 100 * sum(row["correct"] for row in selected) / len(selected)
-    return {"total": len(rows), "accuracy": sum(splits.values()) / 3, "splits": splits}
+        if selected:
+            splits[split] = 100 * sum(row["correct"] for row in selected) / len(selected)
+    return {"total": len(rows), "accuracy": sum(splits.values()) / len(splits), "splits": splits}
 
 
 parser = argparse.ArgumentParser(description="Evaluate SelectGround on a GUI grounding benchmark.")
