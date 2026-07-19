@@ -77,10 +77,7 @@ Official benchmark pages: [ScreenSpot-Pro](https://huggingface.co/datasets/lscpk
 
 ## Train
 
-The released data contain the exact screenshots and annotations used by the two fixed recipes:
-
-- [SelectGround-8B-Data](https://huggingface.co/datasets/ruotian/SelectGround-8B-Data): 3,790 target–distractor pairs, 3,790 replay examples, and the 502-pair final refinement set.
-- [SelectGround-30B-A3B-Data](https://huggingface.co/datasets/ruotian/SelectGround-30B-A3B-Data): 3,790 target–distractor pairs and 3,790 replay examples.
+The released [SelectGround-Data](https://huggingface.co/datasets/ruotian/SelectGround-Data) contains the exact screenshots and annotations used by both fixed recipes: 3,790 target–distractor pairs and 3,790 replay examples. The 8B recipe additionally uses the included 502-pair final refinement set with 502 matched replay examples.
 
 The fixed recipes use two GPUs for 8B and four 80 GB GPUs for 30B-A3B:
 
@@ -95,8 +92,7 @@ Training is standard LoRA SFT. On mined examples, the loss additionally ranks th
 
 - [SelectGround-8B](https://huggingface.co/ruotian/SelectGround-8B)
 - [SelectGround-30B-A3B](https://huggingface.co/ruotian/SelectGround-30B-A3B)
-- [SelectGround-8B-Data](https://huggingface.co/datasets/ruotian/SelectGround-8B-Data)
-- [SelectGround-30B-A3B-Data](https://huggingface.co/datasets/ruotian/SelectGround-30B-A3B-Data)
+- [SelectGround-Data](https://huggingface.co/datasets/ruotian/SelectGround-Data)
 
 The screenshots in the training repositories are the required subset of [Click-100K](https://huggingface.co/datasets/mlfoundations/Click-100k). Every example retains its upstream split and index.
 
