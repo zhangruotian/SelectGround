@@ -5,4 +5,5 @@ Pillow==12.2.0
 qwen-vl-utils==0.0.14
 safetensors==0.7.0
 torch==2.11.0
+torchvision==0.26.0
 transformers==4.57.1
