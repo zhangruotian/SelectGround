@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import random
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -313,17 +314,17 @@ def main() -> None:
             inputs, labels, query = encode(processor, row, accelerator.device)
             visual = torch.nonzero(inputs["input_ids"][0] == int(_value(config, "image_token_id")), as_tuple=False).flatten()
             keep = int(labels.ne(-100).sum()) + 1
-            if semantic:
-                with Attention(model, query, visual) as attention:
-                    output = model(**inputs, use_cache=False, logits_to_keep=keep)
-                scores = selector(attention.ordered())
-                semantic_loss = selection_loss(scores, row, inputs["image_grid_thw"][0], config)
-            else:
+            context = Attention(model, query, visual) if semantic else nullcontext()
+            with context as attention:
                 output = model(**inputs, use_cache=False, logits_to_keep=keep)
-                semantic_loss = output.logits.sum() * 0
-            coord_loss = coordinate_loss(output.logits, inputs["input_ids"], labels)
-            loss = coord_loss + .1 * semantic_loss
-            accelerator.backward(loss)
+                if semantic:
+                    scores = selector(attention.ordered())
+                    semantic_loss = selection_loss(scores, row, inputs["image_grid_thw"][0], config)
+                else:
+                    semantic_loss = output.logits.sum() * 0
+                coord_loss = coordinate_loss(output.logits, inputs["input_ids"], labels)
+                loss = coord_loss + .1 * semantic_loss
+                accelerator.backward(loss)
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(list(model.parameters()) + list(selector.parameters()), 1.0)
                 optimizer.step()
