@@ -8,12 +8,13 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from huggingface_hub import snapshot_download
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, get_scheduler
@@ -224,30 +225,75 @@ def scheduler_for(model_size: str, optimizer: torch.optim.Optimizer):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, functions)
 
 
-def save(accelerator: Accelerator, model: Any, selector: Any, processor: Any, output: Path, revision: str) -> None:
+def save(
+    accelerator: Accelerator,
+    model: Any,
+    selector: Any,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    processor: Any,
+    output: Path,
+    revision: str,
+    completed: int,
+) -> None:
     accelerator.wait_for_everyone()
-    if not accelerator.is_main_process:
-        return
-    output.mkdir(parents=True, exist_ok=True)
-    unwrapped = accelerator.unwrap_model(model)
-    unwrapped.save_pretrained(output, safe_serialization=True)
-    config_path = output / "adapter_config.json"
-    config = json.loads(config_path.read_text())
-    config["revision"] = revision
-    config_path.write_text(json.dumps(config, indent=2) + "\n")
-    merger = {name: value.detach().cpu() for name, value in unwrapped.named_parameters() if ".visual.merger." in f".{name}"}
-    torch.save({"state_dict": merger}, output / "visual_merger.pt")
-    head = accelerator.unwrap_model(selector)
-    torch.save({"layers": LAYERS, "layer_head_weights": head.layer_head_weights.detach().cpu()}, output / "selection_head.pt")
-    processor.save_pretrained(output)
+    if accelerator.is_main_process:
+        output.mkdir(parents=True, exist_ok=True)
+        unwrapped = accelerator.unwrap_model(model)
+        unwrapped.save_pretrained(output, safe_serialization=True)
+        config_path = output / "adapter_config.json"
+        config = json.loads(config_path.read_text())
+        config["revision"] = revision
+        config_path.write_text(json.dumps(config, indent=2) + "\n")
+        merger = {name: value.detach().cpu() for name, value in unwrapped.named_parameters() if ".visual.merger." in f".{name}"}
+        torch.save({"state_dict": merger}, output / "visual_merger.pt")
+        head = accelerator.unwrap_model(selector)
+        torch.save({"layers": LAYERS, "layer_head_weights": head.layer_head_weights.detach().cpu()}, output / "selection_head.pt")
+        torch.save(
+            {"completed": completed, "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()},
+            output / "training_state.pt",
+        )
+        processor.save_pretrained(output)
+    accelerator.wait_for_everyone()
+    rng = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all(),
+    }
+    torch.save(rng, output / f"rng_state_rank_{accelerator.process_index}.pt")
+
+
+def restore(checkpoint: Path, optimizer: torch.optim.Optimizer, scheduler: Any, accelerator: Accelerator) -> int:
+    state = torch.load(checkpoint / "training_state.pt", map_location="cpu", weights_only=False)
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+    rng = torch.load(
+        checkpoint / f"rng_state_rank_{accelerator.process_index}.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    random.setstate(rng["python"])
+    np.random.set_state(rng["numpy"])
+    torch.set_rng_state(rng["torch"])
+    torch.cuda.set_rng_state_all(rng["cuda"])
+    return int(state["completed"])
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the two SelectGround checkpoints from the paper.")
     parser.add_argument("--model", choices=("8b", "30b"), required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--stage", choices=("all", "phase_a", "phase_b"), default="all")
+    parser.add_argument("--checkpoint", type=Path)
     args = parser.parse_args()
     recipe = RECIPES[args.model]
+    if args.model == "8b" and args.stage == "all":
+        raise ValueError("8b training requires --stage phase_a followed by --stage phase_b")
+    if args.model == "30b" and args.stage != "all":
+        raise ValueError("30b training uses --stage all")
+    if args.stage == "phase_b" and args.checkpoint is None:
+        raise ValueError("phase_b requires --checkpoint")
     accelerator = Accelerator(
         gradient_accumulation_steps=recipe["accumulation"],
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False)],
@@ -261,10 +307,12 @@ def main() -> None:
     random.Random(SEED).shuffle(pairs)
     pairs = pairs[max(1, round(.02 * len(pairs))) :]
     replay = read_rows(data / "data" / "train_replay.jsonl")
-    pair_loader, replay_loader = loader(pairs, data, SEED + 1001), loader(replay, data, SEED + 2001)
-    if args.model == "8b":
-        refine_pairs = loader(read_rows(data / "data" / "refinement_pairs.jsonl"), data, SEED + 3001)
-        refine_replay = loader(read_rows(data / "data" / "refinement_replay.jsonl"), data, SEED + 4001)
+    pair_seed, replay_seed = SEED + 1001, SEED + 2001
+    if args.stage == "phase_b":
+        pairs = read_rows(data / "data" / "refinement_pairs.jsonl")
+        replay = read_rows(data / "data" / "refinement_replay.jsonl")
+        pair_seed, replay_seed = SEED + 3001, SEED + 4001
+    pair_loader, replay_loader = loader(pairs, data, pair_seed), loader(replay, data, replay_seed)
 
     processor = AutoProcessor.from_pretrained(
         recipe["base"], revision=recipe["revision"], min_pixels=3136, max_pixels=8847360
@@ -274,13 +322,20 @@ def main() -> None:
         recipe["base"], revision=recipe["revision"], config=base_config,
         dtype=torch.bfloat16, attn_implementation="sdpa"
     )
-    model = get_peft_model(model, LoraConfig(
-        r=64,
-        lora_alpha=128,
-        lora_dropout=.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        task_type="CAUSAL_LM",
-    ))
+    if args.checkpoint is None:
+        model = get_peft_model(model, LoraConfig(
+            r=64,
+            lora_alpha=128,
+            lora_dropout=.05,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            task_type="CAUSAL_LM",
+        ))
+    else:
+        import transformers.integrations.tensor_parallel as tensor_parallel
+
+        if not hasattr(tensor_parallel, "EmbeddingParallel"):
+            tensor_parallel.EmbeddingParallel = type("EmbeddingParallel", (), {})
+        model = PeftModel.from_pretrained(model, args.checkpoint, is_trainable=True)
     for parameter in model.parameters():
         if parameter.requires_grad:
             parameter.data = parameter.data.to(torch.bfloat16)
@@ -290,6 +345,9 @@ def main() -> None:
     config = _find_config(model)
     heads = int(_value(_value(config, "text_config", config), "num_attention_heads"))
     selector = HeadSelector(heads)
+    if args.checkpoint is not None:
+        head = torch.load(args.checkpoint / "selection_head.pt", map_location="cpu", weights_only=False)
+        selector.layer_head_weights.data.copy_(head["layer_head_weights"])
     optimizer = torch.optim.AdamW([
         {"params": [parameter for parameter in model.parameters() if parameter.requires_grad], "lr": recipe["learning_rate"]},
         {"params": selector.parameters(), "lr": 1e-4},
@@ -300,18 +358,13 @@ def main() -> None:
     )
     model.train()
     selector.train()
-    if args.model == "8b":
-        refine_pairs, refine_replay = accelerator.prepare(refine_pairs, refine_replay)
     iterators = [iter(pair_loader), iter(replay_loader)]
-    if args.model == "8b":
-        refine_iterators = [iter(refine_pairs), iter(refine_replay)]
     micro_step = 0
-    completed = 0
+    completed = restore(args.checkpoint, optimizer, scheduler, accelerator) if args.checkpoint else 0
+    target = 125 if args.stage == "phase_a" else recipe["steps"]
     optimizer.zero_grad(set_to_none=True)
-    while completed < recipe["steps"]:
+    while completed < target:
         active_loaders, active_iterators = (pair_loader, replay_loader), iterators
-        if args.model == "8b" and completed >= 125:
-            active_loaders, active_iterators = (refine_pairs, refine_replay), refine_iterators
         semantic = micro_step % 2 == 1
         index = 0 if semantic else 1
         row, active_iterators[index] = next_row(active_loaders[index], active_iterators[index])
@@ -340,7 +393,17 @@ def main() -> None:
             completed += 1
             if accelerator.is_main_process:
                 print(f"step={completed} loss={float(loss):.4f} coord={float(coord_loss):.4f} selection={float(semantic_loss):.4f}", flush=True)
-    save(accelerator, model, selector, processor, args.output, recipe["revision"])
+    save(
+        accelerator,
+        model,
+        selector,
+        optimizer,
+        scheduler,
+        processor,
+        args.output,
+        recipe["revision"],
+        completed,
+    )
 
 
 if __name__ == "__main__":

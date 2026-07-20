@@ -17,7 +17,7 @@ UI-Vision is the equal-weight mean of its basic, functional, and spatial element
 
 ## Install
 
-Python 3.11 and a CUDA GPU are recommended.
+The training results below were reproduced with Python 3.12, CUDA 12.8, and the pinned packages in `requirements.txt`.
 
 ```bash
 git clone https://github.com/zhangruotian/SelectGround.git
@@ -80,14 +80,25 @@ Official benchmark pages: [ScreenSpot-Pro](https://huggingface.co/datasets/lscpk
 
 The released [SelectGround-Data](https://huggingface.co/datasets/ruotian/SelectGround-Data) contains the exact screenshots and annotations used by both fixed recipes: 3,790 target–distractor pairs and 3,790 replay examples. The 8B recipe additionally uses the included 502-pair final refinement set with 502 matched replay examples.
 
-The fixed recipes use two 48 GB GPUs for 8B and four 80 GB GPUs for 30B-A3B:
+The 8B model was trained on two L40S GPUs. Its two stages must run as separate processes: phase A writes the adapter together with the optimizer, scheduler, and per-rank RNG states; phase B restores those states before using the refinement set. Combining the stages in one process changes gradient accumulation at dataloader boundaries and does not reproduce the model.
 
 ```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --mixed_precision bf16 --num_processes 2 train.py --model 8b --output outputs/SelectGround-8B
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --mixed_precision bf16 --num_processes 2 train.py \
+  --model 8b --stage phase_a --output outputs/SelectGround-8B-phase-a
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --mixed_precision bf16 --num_processes 2 train.py \
+  --model 8b --stage phase_b --checkpoint outputs/SelectGround-8B-phase-a --output outputs/SelectGround-8B
+```
+
+The 30B-A3B model was trained in one stage on four 80 GB A100 GPUs:
+
+```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --mixed_precision bf16 --num_processes 4 train.py --model 30b --output outputs/SelectGround-30B-A3B
 ```
 
 Training is standard LoRA SFT. On mined examples, the loss additionally ranks the target region above the verified distractor and three hard UI regions. The training-only head aggregation is saved as `selection_head.pt`; inference uses only the trained grounding model.
+
+With the pinned environment, two independent 8B clean runs reached 64.39 and 64.64 on ScreenSpot-Pro; one was also evaluated at 39.17 on UI-Vision and 69.02 on OSWorld-G. Independent 30B-A3B clean runs reached 64.20--64.83 on ScreenSpot-Pro, 38.57--38.90 on UI-Vision, and 70.98--71.76 on OSWorld-G. Small run-to-run differences remain across GPU nodes because the training kernels are not bitwise deterministic.
 
 ## Models and data
 
