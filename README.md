@@ -9,7 +9,7 @@ SelectGround maps a screenshot and instruction to one click. It is trained with 
 | Model | Inference | ScreenSpot-Pro | UI-Vision | OSWorld-G |
 |---|---|---:|---:|---:|
 | SelectGround-8B | Direct | 64.96 | 38.68 | 70.00 |
-| SelectGround-8B | + ConGround | **72.17** | **44.39** | **70.00** |
+| SelectGround-8B | + ConGround | **72.17** | **44.41** | **70.20** |
 | SelectGround-30B-A3B | Direct | 65.91 | 38.69 | 72.35 |
 | SelectGround-30B-A3B | + ConGround | **73.43** | **46.07** | **73.33** |
 

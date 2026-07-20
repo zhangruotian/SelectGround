@@ -31,6 +31,7 @@ class SelectGround:
         adapter_config = json.loads((checkpoint_path / "adapter_config.json").read_text())
         base_model = adapter_config["base_model_name_or_path"]
         revision = adapter_config["revision"]
+        self.agreement_radius = 12.0 if "Qwen3-VL-8B" in base_model else 1.0
         model = AutoModelForImageTextToText.from_pretrained(
             base_model,
             revision=revision,
@@ -69,7 +70,7 @@ class SelectGround:
         q0, h0 = self._crop_observations(source, instruction, p0["point"])
         distance = _token_distance(p0["point"], p1["point"], size, grid)
         candidates = {"p0": p0, "p1": p1, "q0": q0, "h0": h0}
-        if distance <= 1.0:
+        if distance <= self.agreement_radius:
             q1, h1 = self._crop_observations(source, instruction, p1["point"])
             candidates.update(q1=q1, h1=h1)
             selected = _medoid(candidates, size, grid)
@@ -82,7 +83,7 @@ class SelectGround:
             "normalized_point": result["normalized_point"],
             "raw_response": result["raw_response"],
             "selected": selected,
-            "agreement": distance <= 1.0,
+            "agreement": distance <= self.agreement_radius,
             "hypothesis_distance": distance,
             "candidates": {name: value["point"] for name, value in candidates.items()},
         }
