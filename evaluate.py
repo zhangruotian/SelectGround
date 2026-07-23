@@ -116,7 +116,7 @@ parser.add_argument("--model", default="ruotian/SelectGround-8B")
 parser.add_argument("--benchmark", choices=("screenspot_pro", "ui_vision", "osworld_g"), required=True)
 parser.add_argument("--data", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
-parser.add_argument("--conground", action="store_true")
+parser.add_argument("--cvl", action="store_true")
 parser.add_argument("--limit", type=int)
 parser.add_argument("--num-shards", type=int, default=1)
 parser.add_argument("--shard", type=int, default=0)
@@ -138,7 +138,7 @@ with args.output.open("a") as output:
     for number, case in enumerate(cases, 1):
         if case["id"] in done:
             continue
-        prediction = grounder.predict(case["image"], case["instruction"], conground=args.conground)
+        prediction = grounder.predict(case["image"], case["instruction"], cvl=args.cvl)
         row = {
             "id": case["id"],
             "instruction": case["instruction"],

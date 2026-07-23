@@ -1,19 +1,20 @@
 # SelectGround
 
-Official code and checkpoints for **Selection, Not Localization: Contrastive Training and Consensus Inference for GUI Grounding**.
+Official code and checkpoints for **Selection, Not Localization: Contrastive Training and Cross-View Likelihood for GUI Grounding**.
 
-SelectGround maps a screenshot and instruction to one click. It is trained with coordinate supervision and an element-aware target–distractor loss. ConGround is its training-free consensus inference method: it challenges the first full-view hypothesis, re-observes the two hypotheses at higher resolution, and resolves the observations with one fixed geometric rule.
+SelectGround maps a screenshot and instruction to one click. It is trained with coordinate supervision and an element-aware target–distractor loss. CVL (Cross-View Likelihood) is its training-free test-time method: it augments the direct click with three separated attention peaks and four screen-covering predictions, restores detail with five fixed crops, and selects the coordinate assigned high likelihood by independent views.
 
 ## Results
 
 | Model | Inference | ScreenSpot-Pro | UI-Vision | OSWorld-G |
 |---|---|---:|---:|---:|
 | SelectGround-8B | Direct | 64.96 | 38.68 | 70.00 |
-| SelectGround-8B | + ConGround | **72.17** | **44.41** | **70.20** |
+| SelectGround-8B | + CVL | **72.36** | **45.10** | **72.55** |
 | SelectGround-30B-A3B | Direct | 65.91 | 38.69 | 72.35 |
-| SelectGround-30B-A3B | + ConGround | **73.43** | **46.07** | **73.33** |
+| SelectGround-30B-A3B | + CVL | **73.69** | **47.08** | **75.69** |
 
 UI-Vision is the equal-weight mean of its basic, functional, and spatial element-grounding subsets. OSWorld-G uses the 510 target-bearing examples and excludes 54 refusal examples.
+CVL always executes one full-screen and five crop forward passes, then one deterministic argmax. Each checkpoint uses one fixed parameter pair unchanged across all three benchmarks; inference uses no UI parser, correctness signal, gate, or route.
 
 ## Install
 
@@ -41,14 +42,14 @@ python infer.py \
   --instruction "Click the Save button"
 ```
 
-SelectGround + ConGround:
+SelectGround + CVL:
 
 ```bash
 python infer.py \
   --model ruotian/SelectGround-8B \
   --image screenshot.png \
   --instruction "Click the Save button" \
-  --conground
+  --cvl
 ```
 
 Use `ruotian/SelectGround-30B-A3B` for the 30B-A3B checkpoint. The returned `point` is in source-image pixels; `normalized_point` uses the `[0,1000]` coordinate system.
@@ -64,12 +65,12 @@ git clone https://github.com/xlang-ai/OSWorld-G.git data/OSWorld-G
 git -C data/OSWorld-G checkout daa6bd8e0e629f0917ad2984df930bf0bd967540
 ```
 
-Run direct inference or append `--conground`:
+Run direct inference or append `--cvl`:
 
 ```bash
-python evaluate.py --model ruotian/SelectGround-8B --benchmark screenspot_pro --data data/screenspot-pro --output outputs/ssp.jsonl --conground
-python evaluate.py --model ruotian/SelectGround-8B --benchmark ui_vision --data data/ui-vision --output outputs/uiv.jsonl --conground
-python evaluate.py --model ruotian/SelectGround-8B --benchmark osworld_g --data data/OSWorld-G --output outputs/osw.jsonl --conground
+python evaluate.py --model ruotian/SelectGround-8B --benchmark screenspot_pro --data data/screenspot-pro --output outputs/ssp.jsonl --cvl
+python evaluate.py --model ruotian/SelectGround-8B --benchmark ui_vision --data data/ui-vision --output outputs/uiv.jsonl --cvl
+python evaluate.py --model ruotian/SelectGround-8B --benchmark osworld_g --data data/OSWorld-G --output outputs/osw.jsonl --cvl
 ```
 
 The evaluator appends one result at a time and resumes from an existing output file.
@@ -96,7 +97,7 @@ The 30B-A3B model was trained in one stage on four 80 GB A100 GPUs:
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --mixed_precision bf16 --num_processes 4 train.py --model 30b --output outputs/SelectGround-30B-A3B
 ```
 
-Training is standard LoRA SFT. On mined examples, the loss additionally ranks the target region above the verified distractor and three hard UI regions. The training-only head aggregation is saved as `selection_head.pt`; inference uses only the trained grounding model.
+Training is standard LoRA SFT. On mined examples, the loss additionally ranks the target region above the verified distractor and three hard UI regions. Direct inference remains ordinary coordinate decoding, while CVL compares a fixed candidate set through the model's native coordinate likelihood without additional training.
 
 With the pinned environment, two independent 8B clean runs reached 64.39 and 64.64 on ScreenSpot-Pro; one was also evaluated at 39.17 on UI-Vision and 69.02 on OSWorld-G. Independent 30B-A3B clean runs reached 64.20--64.83 on ScreenSpot-Pro, 38.57--38.90 on UI-Vision, and 70.98--71.76 on OSWorld-G. Small run-to-run differences remain across GPU nodes because the training kernels are not bitwise deterministic.
 
@@ -112,7 +113,7 @@ The screenshots in the training repositories are the required subset of [Click-1
 
 ```bibtex
 @article{selectground2026,
-  title={Selection, Not Localization: Contrastive Training and Consensus Inference for GUI Grounding},
+  title={Selection, Not Localization: Contrastive Training and Cross-View Likelihood for GUI Grounding},
   author={Anonymous},
   year={2026}
 }

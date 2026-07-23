@@ -1,8 +1,6 @@
-from __future__ import annotations
-
 import json
-import math
 import re
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +20,7 @@ Instruction: {instruction}"""
 
 
 class SelectGround:
-    """SelectGround direct grounding and ConGround test-time inference."""
+    """SelectGround direct grounding and CVL test-time inference."""
 
     def __init__(self, checkpoint: str = "ruotian/SelectGround-8B") -> None:
         checkpoint_path = Path(checkpoint)
@@ -31,7 +29,8 @@ class SelectGround:
         adapter_config = json.loads((checkpoint_path / "adapter_config.json").read_text())
         base_model = adapter_config["base_model_name_or_path"]
         revision = adapter_config["revision"]
-        self.agreement_radius = 12.0 if "Qwen3-VL-8B" in base_model else 1.0
+        self.cvl_proximity_weight = 0.0 if "30B" in base_model else 0.5
+        self.cvl_q0_weight = 0.5 if "30B" in base_model else 0.0
         model = AutoModelForImageTextToText.from_pretrained(
             base_model,
             revision=revision,
@@ -54,74 +53,103 @@ class SelectGround:
             max_pixels=8847360,
         )
         self.device = next(self.model.parameters()).device
-        self.core = _find_core(self.model)
-        config = _find_config(self.model)
-        self.image_token_id = int(_value(config, "image_token_id"))
-        self.merge_size = int(_value(_value(config, "vision_config"), "spatial_merge_size", 2))
+        base = self.model.base_model.model
+        self.core = base.model
+        self.image_token_id = int(base.config.image_token_id)
+        self.merge_size = int(base.config.vision_config.spatial_merge_size)
 
-    def predict(self, image: str | Path | Image.Image, instruction: str, *, conground: bool = False) -> dict[str, Any]:
+    def predict(
+        self,
+        image: str | Path | Image.Image,
+        instruction: str,
+        *,
+        cvl: bool = False,
+    ) -> dict[str, Any]:
         source = Image.open(image).convert("RGB") if not isinstance(image, Image.Image) else image.convert("RGB")
         size = source.size
-        if not conground:
-            direct, _, _, _, _ = self._direct(source, size, instruction)
-            return {"method": "SelectGround", **direct}
+        p0, full_view, raw_scores, grid = self._observe(
+            source,
+            size,
+            instruction,
+            box=(0, 0, size[0], size[1]),
+            capture_attention=cvl,
+        )
+        if not cvl:
+            return {"method": "SelectGround", **p0}
 
-        p0, p1, grid = self._observe(source, size, instruction)
-        q0, h0 = self._crop_observations(source, instruction, p0["point"])
-        distance = _token_distance(p0["point"], p1["point"], size, grid)
-        candidates = {"p0": p0, "p1": p1, "q0": q0, "h0": h0}
-        if distance <= self.agreement_radius:
-            q1, h1 = self._crop_observations(source, instruction, p1["point"])
-            candidates.update(q1=q1, h1=h1)
-            selected = _medoid(candidates, size, grid)
-        else:
-            selected = "q0"
-        result = candidates[selected]
+        if p0["point"] is None:
+            row, column = divmod(int(raw_scores.argmax()), grid[1])
+            p0 = _point_prediction(
+                [(column + 0.5) / grid[1] * size[0], (row + 0.5) / grid[0] * size[1]],
+                size,
+            )
+        current = _point_to_index(p0["point"], size, grid)
+        p0_anchor = p0["point"]
+        peaks = _top_peaks(raw_scores, current, size, grid)
+        width, height = size
+        proposals = [
+            (p0_anchor, 0.40),
+            ([0.3 * width, 0.3 * height], 0.60),
+            ([0.7 * width, 0.3 * height], 0.60),
+            ([0.3 * width, 0.7 * height], 0.60),
+            ([0.7 * width, 0.7 * height], 0.60),
+        ]
+        observations = [
+            self._crop_view(source, instruction, anchor, fraction)
+            for anchor, fraction in proposals
+        ]
+        q0 = observations[0][0]
+        grids = [observation[0] for observation in observations[1:]]
+        top_predictions = [_point_prediction(point, size) for point in peaks]
+        predictions = [p0, q0, *top_predictions, *grids]
+        points = [prediction["point"] for prediction in predictions]
+        source_views = [0, 1, 0, 0, 0, 2, 3, 4, 5]
+        selected = self._cvl_select(
+            points,
+            [full_view, *(view for _, view in observations)],
+            source_views,
+            size,
+        )
+        result = predictions[selected]
         return {
-            "method": "SelectGround+ConGround",
+            "method": "SelectGround+CVL",
             "point": result["point"],
             "normalized_point": result["normalized_point"],
             "raw_response": result["raw_response"],
-            "selected": selected,
-            "agreement": distance <= self.agreement_radius,
-            "hypothesis_distance": distance,
-            "candidates": {name: value["point"] for name, value in candidates.items()},
         }
 
-    def _observe(
-        self, image: Image.Image, logical_size: tuple[int, int], instruction: str
-    ) -> tuple[dict[str, Any], dict[str, Any], tuple[int, int]]:
-        direct, scores, cache, position_ids, state = self._direct(image, logical_size, instruction)
-        point = direct["point"]
-        current = _point_to_index(point, logical_size, state["grid"]) if point is not None else int(scores.argmax())
-        incumbent, alternative = _hypotheses(scores, current, state["grid"])
-        raw = self._reconsider(state, cache, position_ids, incumbent, alternative)
-        return direct, _prediction(raw, logical_size), state["grid"]
-
-    def _crop_observations(
-        self, image: Image.Image, instruction: str, anchor: list[float] | None
+    def _crop_view(
+        self, image: Image.Image, instruction: str, anchor: list[float], fraction: float
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        if anchor is None:
-            invalid = {"point": None, "normalized_point": None, "raw_response": ""}
-            return invalid, invalid
-        box = _crop_box(anchor, image.size)
+        box = _crop_box(anchor, image.size, fraction)
         crop = image.crop(box)
         logical_size = crop.size
         zoomed = crop.resize((2 * logical_size[0], 2 * logical_size[1]), Image.Resampling.LANCZOS)
-        direct, challenge, _ = self._observe(zoomed, logical_size, instruction)
-        return _map_crop(direct, box, image.size), _map_crop(challenge, box, image.size)
+        direct, view, _, _ = self._observe(
+            zoomed,
+            logical_size,
+            instruction,
+            box=box,
+            capture_attention=False,
+        )
+        mapped = _map_crop(direct, box, image.size)
+        return (mapped if mapped["point"] is not None else _point_prediction(anchor, image.size)), view
 
-    def _direct(
-        self, image: Image.Image, logical_size: tuple[int, int], instruction: str
-    ) -> tuple[dict[str, Any], torch.Tensor, DynamicCache, torch.Tensor, dict[str, Any]]:
+    def _observe(
+        self,
+        image: Image.Image,
+        logical_size: tuple[int, int],
+        instruction: str,
+        *,
+        box: tuple[int, int, int, int],
+        capture_attention: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any], torch.Tensor | None, tuple[int, int]]:
         inputs = self._inputs(image, instruction)
         input_ids = inputs["input_ids"]
         length = int(input_ids.shape[1])
         visual = torch.nonzero(input_ids[0] == self.image_token_id, as_tuple=False).flatten()
         image_grid = inputs["image_grid_thw"][0].detach().cpu().long()
         grid = (int(image_grid[1]) // self.merge_size, int(image_grid[2]) // self.merge_size)
-        if visual.numel() != grid[0] * grid[1]:
-            raise RuntimeError("visual-token grid does not match the encoded image")
         position_ids, _ = self.core.get_rope_index(
             input_ids,
             inputs.get("image_grid_thw"),
@@ -129,7 +157,11 @@ class SelectGround:
             attention_mask=inputs.get("attention_mask"),
         )
         cache = DynamicCache(config=self.core.language_model.config)
-        attention = _Attention(self.model, length - 1, visual, list(range(18, 24)))
+        attention = (
+            _Attention(self.model, length - 1, visual)
+            if capture_attention
+            else nullcontext()
+        )
         with torch.inference_mode(), attention:
             output = self.model(
                 **inputs,
@@ -139,43 +171,155 @@ class SelectGround:
                 use_cache=True,
                 logits_to_keep=1,
             )
-        scores = torch.stack(attention.ordered()).float().cpu().mean(dim=(0, 1))
-        raw = self._decode(output.logits[:, -1, :], _clone_cache(cache), position_ids[:, :, -1:] + 1)
-        state = {"inputs": inputs, "visual": visual, "length": length, "grid": grid}
-        return _prediction(raw, logical_size), scores, cache, position_ids, state
-
-    def _reconsider(
-        self,
-        state: dict[str, Any],
-        first_cache: DynamicCache,
-        position_ids: torch.Tensor,
-        incumbent: torch.Tensor,
-        alternative: torch.Tensor,
-    ) -> str:
-        inputs, visual, length = state["inputs"], state["visual"], state["length"]
-        explore, reconcile = _visibilities(length, visual, incumbent, alternative)
-        second_inputs = {
-            key: value
-            for key, value in inputs.items()
-            if key in {"input_ids", "pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"}
-        }
-        with torch.inference_mode(), _Prefix(self.model, explore, reconcile):
-            output = self.model(
-                **second_inputs,
-                past_key_values=_clone_cache(first_cache),
-                attention_mask=torch.ones((1, 2 * length), dtype=torch.long, device=self.device),
-                position_ids=position_ids,
-                cache_position=torch.arange(length, 2 * length, device=self.device),
-                use_cache=True,
-                logits_to_keep=1,
+        raw_scores = None
+        if capture_attention:
+            layer_scores = torch.stack(
+                [value.float().cpu() for value in attention.ordered()]
             )
-        keep = torch.cat((torch.arange(length), visual.detach().cpu() + length))
-        layers = []
-        for keys, values in output.past_key_values.to_legacy_cache():
-            indices = keep.to(keys.device)
-            layers.append((keys.index_select(2, indices), values.index_select(2, indices)))
-        cache = DynamicCache.from_legacy_cache(tuple(layers))
-        return self._decode(output.logits[:, -1, :], cache, position_ids[:, :, -1:] + 1)
+            raw_scores = layer_scores.mean(dim=(0, 1))
+        raw = self._decode(output.logits[:, -1, :], _clone_cache(cache), position_ids[:, :, -1:] + 1)
+        view = {
+            "box": box,
+            "logical_size": logical_size,
+            "initial_logits": output.logits[:, -1, :],
+            "cache": cache,
+            "position_ids": position_ids,
+        }
+        return _prediction(raw, logical_size), view, raw_scores, grid
+
+    @torch.inference_mode()
+    def _score_responses(
+        self, view: dict[str, Any], responses: list[str]
+    ) -> dict[str, float]:
+        unique = list(dict.fromkeys(responses))
+        token_ids = [
+            self.processor.tokenizer(response, add_special_tokens=False)["input_ids"]
+            for response in unique
+        ]
+        lengths = [len(values) for values in token_ids]
+        initial = torch.log_softmax(view["initial_logits"].detach().float(), dim=-1)[0]
+        logprobs = [[float(initial[values[0]])] for values in token_ids]
+        max_length = max(lengths)
+        if max_length > 1:
+            tokenizer = self.processor.tokenizer
+            batch = len(unique)
+            continuation = torch.full(
+                (batch, max_length - 1),
+                tokenizer.pad_token_id,
+                dtype=torch.long,
+                device=self.device,
+            )
+            mask = torch.zeros_like(continuation, dtype=torch.bool)
+            for index, values in enumerate(token_ids):
+                prefix = values[:-1]
+                continuation[index, : len(prefix)] = torch.tensor(
+                    prefix, device=self.device
+                )
+                mask[index, : len(prefix)] = True
+            cache = _clone_cache(view["cache"])
+            cache.batch_repeat_interleave(batch)
+            prompt_length = view["cache"].get_seq_length()
+            attention_mask = torch.cat(
+                (
+                    torch.ones(
+                        (batch, prompt_length),
+                        dtype=torch.long,
+                        device=self.device,
+                    ),
+                    mask.long(),
+                ),
+                dim=1,
+            )
+            offsets = torch.arange(max_length - 1, device=self.device).view(1, 1, -1)
+            position_ids = (
+                view["position_ids"][:, :, -1:] + 1 + offsets
+            ).expand(-1, batch, -1)
+            output = self.model(
+                input_ids=continuation,
+                past_key_values=cache,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                cache_position=torch.arange(
+                    prompt_length,
+                    prompt_length + max_length - 1,
+                    device=self.device,
+                ),
+                use_cache=True,
+                logits_to_keep=max_length - 1,
+            )
+            for index, values in enumerate(token_ids):
+                if len(values) == 1:
+                    continue
+                logits = output.logits[index, : len(values) - 1].detach().float()
+                labels = torch.tensor(values[1:], device=logits.device)
+                selected = torch.log_softmax(logits, dim=-1).gather(
+                    1, labels[:, None]
+                )[:, 0]
+                logprobs[index].extend(float(value) for value in selected.cpu())
+        return {
+            response: sum(values) / len(values)
+            for response, values in zip(unique, logprobs, strict=True)
+        }
+
+    def _cvl_select(
+        self,
+        points: list[list[float]],
+        views: list[dict[str, Any]],
+        source_views: list[int],
+        size: tuple[int, int],
+    ) -> int:
+        per_view = []
+        for view in views:
+            box = view["box"]
+            local = [
+                (
+                    [point[0] - box[0], point[1] - box[1]]
+                    if box[0] <= point[0] < box[2] and box[1] <= point[1] < box[3]
+                    else None
+                )
+                for point in points
+            ]
+            responses = [
+                _point_response(point, view["logical_size"])
+                for point in local
+                if point is not None
+            ]
+            scores = self._score_responses(view, responses)
+            unique = torch.tensor(list(scores.values()), dtype=torch.float32)
+            normalized = {
+                response: float(value)
+                for response, value in zip(
+                    scores,
+                    _zscore(unique).tolist(),
+                    strict=True,
+                )
+            }
+            per_view.append(
+                [
+                    normalized[_point_response(point, view["logical_size"])]
+                    if point is not None
+                    else None
+                    for point in local
+                ]
+            )
+
+        cross = []
+        for candidate, source_view in enumerate(source_views):
+            evidence = [
+                values[candidate]
+                for view_index, values in enumerate(per_view)
+                if view_index != source_view and values[candidate] is not None
+            ]
+            cross.append(sum(evidence) / len(evidence))
+        cross_score = _zscore(torch.tensor(cross, dtype=torch.float32))
+        normalized_points = torch.tensor(
+            [[point[0] / size[0], point[1] / size[1]] for point in points],
+            dtype=torch.float32,
+        )
+        proximity = _zscore(-torch.cdist(normalized_points, normalized_points)[:, 1])
+        score = cross_score + self.cvl_proximity_weight * proximity
+        score[1] += self.cvl_q0_weight
+        return int(score.argmax())
 
     @torch.inference_mode()
     def _decode(self, logits: torch.Tensor, cache: DynamicCache, position_ids: torch.Tensor) -> str:
@@ -214,16 +358,16 @@ class SelectGround:
             ],
         }]
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        images, videos = process_vision_info(messages)
-        kwargs = {"text": [text], "images": images, "padding": True, "return_tensors": "pt"}
-        if videos is not None:
-            kwargs["videos"] = videos
-        return self.processor(**kwargs).to(self.device)
+        images, _ = process_vision_info(messages)
+        return self.processor(
+            text=[text], images=images, padding=True, return_tensors="pt"
+        ).to(self.device)
 
 
 class _Attention:
-    def __init__(self, model: Any, query: int, visual: torch.Tensor, layers: list[int]) -> None:
-        self.model, self.query, self.visual, self.layers = model, query, visual, layers
+    def __init__(self, model: Any, query: int, visual: torch.Tensor) -> None:
+        self.model, self.query, self.visual = model, query, visual
+        self.layers = range(18, 24)
         self.handles: list[Any] = []
         self.values: dict[int, torch.Tensor] = {}
 
@@ -255,36 +399,6 @@ class _Attention:
         return [self.values[layer] for layer in self.layers]
 
 
-class _Prefix:
-    def __init__(self, model: Any, explore: torch.Tensor, reconcile: torch.Tensor) -> None:
-        self.model, self.explore, self.reconcile = model, explore, reconcile
-        self.handles: list[Any] = []
-
-    def __enter__(self) -> "_Prefix":
-        for module in self.model.modules():
-            layer = getattr(getattr(module, "self_attn", None), "layer_idx", None)
-            if layer is not None and int(layer) >= 2:
-                self.handles.append(module.register_forward_pre_hook(self._hook(int(layer)), with_kwargs=True))
-        return self
-
-    def __exit__(self, *_: Any) -> None:
-        for handle in self.handles:
-            handle.remove()
-
-    def _hook(self, layer: int):
-        def hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]):
-            mask = kwargs["attention_mask"].clone()
-            visible = self.explore if layer < 12 else self.reconcile
-            hidden = torch.nonzero(~visible, as_tuple=False).flatten().to(mask.device)
-            if mask.dtype == torch.bool:
-                mask[..., hidden] = False
-            else:
-                mask[..., hidden] = torch.finfo(mask.dtype).min
-            return args, {**kwargs, "attention_mask": mask}
-
-        return hook
-
-
 def _attention_logits(
     attention: Any,
     hidden: torch.Tensor,
@@ -308,47 +422,24 @@ def _attention_logits(
     return ((queries[:, :, query_position, :].unsqueeze(2) * visual).sum(-1) * attention.scaling)[0]
 
 
-def _hypotheses(
-    scores: torch.Tensor, current: int, grid: tuple[int, int]
-) -> tuple[torch.Tensor, torch.Tensor]:
-    height, width = grid
-    rows = torch.arange(height).repeat_interleave(width)
-    columns = torch.arange(width).repeat(height)
-    current_row, current_column = divmod(current, width)
-    distance = (rows - current_row).square() + (columns - current_column).square()
-    order = torch.argsort(distance * (height * width + 1) + torch.arange(height * width))
-    incumbent = order[:64]
-    occupied = torch.zeros(height * width, dtype=torch.bool)
-    occupied[incumbent] = True
-    far = torch.maximum((rows - current_row).abs(), (columns - current_column).abs()) >= 11
-    eligible = ~occupied & far
-    if not eligible.any():
-        eligible = ~occupied
-    alternative_center = int(scores.masked_fill(~eligible, -torch.inf).argmax())
-    row, column = divmod(alternative_center, width)
-    distance = (rows - row).square() + (columns - column).square()
-    order = torch.argsort(distance * (height * width + 1) + torch.arange(height * width))
-    alternative = order[~occupied[order]][:64]
-    return incumbent.sort().values, alternative.sort().values
-
-
-def _visibilities(
-    length: int, visual: torch.Tensor, incumbent: torch.Tensor, alternative: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    visual = visual.detach().cpu()
-    explore = torch.zeros(length, dtype=torch.bool)
-    explore[visual[alternative]] = True
-    explore[int(visual[-1]) + 1 :] = True
-    reconcile = explore.clone()
-    reconcile[visual[incumbent]] = True
-    return explore, reconcile
-
-
 def _prediction(raw: str, size: tuple[int, int]) -> dict[str, Any]:
     match = re.search(r"[\[(]\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*[\])]", raw)
     normalized = [float(match.group(1)), float(match.group(2))] if match else None
     point = [normalized[0] / 1000 * size[0], normalized[1] / 1000 * size[1]] if normalized else None
     return {"point": point, "normalized_point": normalized, "raw_response": raw}
+
+
+def _point_prediction(point: list[float], size: tuple[int, int]) -> dict[str, Any]:
+    normalized = [point[0] / size[0] * 1000, point[1] / size[1] * 1000]
+    return {
+        "point": point,
+        "normalized_point": normalized,
+        "raw_response": f"[{round(normalized[0])},{round(normalized[1])}]",
+    }
+
+
+def _point_response(point: list[float], size: tuple[int, int]) -> str:
+    return f"[{round(point[0] / size[0] * 1000)},{round(point[1] / size[1] * 1000)}]"
 
 
 def _map_crop(prediction: dict[str, Any], box: tuple[int, int, int, int], size: tuple[int, int]) -> dict[str, Any]:
@@ -359,72 +450,52 @@ def _map_crop(prediction: dict[str, Any], box: tuple[int, int, int, int], size: 
     return {"point": mapped, "normalized_point": normalized, "raw_response": raw}
 
 
-def _crop_box(point: list[float], size: tuple[int, int]) -> tuple[int, int, int, int]:
+def _crop_box(
+    point: list[float], size: tuple[int, int], fraction: float
+) -> tuple[int, int, int, int]:
     width, height = size
-    crop_width, crop_height = min(width, max(320, round(.4 * width))), min(height, max(320, round(.4 * height)))
+    crop_width = min(width, max(320, round(fraction * width)))
+    crop_height = min(height, max(320, round(fraction * height)))
     left = round(min(max(0.0, point[0] - crop_width / 2), width - crop_width))
     top = round(min(max(0.0, point[1] - crop_height / 2), height - crop_height))
     return left, top, left + crop_width, top + crop_height
 
 
 def _point_to_index(point: list[float], size: tuple[int, int], grid: tuple[int, int]) -> int:
-    x = min(max(point[0], 0.0), math.nextafter(float(size[0]), 0.0))
-    y = min(max(point[1], 0.0), math.nextafter(float(size[1]), 0.0))
-    return min(int(y / size[1] * grid[0]), grid[0] - 1) * grid[1] + min(int(x / size[0] * grid[1]), grid[1] - 1)
+    row = min(int(point[1] / size[1] * grid[0]), grid[0] - 1)
+    column = min(int(point[0] / size[0] * grid[1]), grid[1] - 1)
+    return row * grid[1] + column
 
 
-def _token_distance(
-    first: list[float] | None,
-    second: list[float] | None,
+def _top_peaks(
+    scores: torch.Tensor,
+    current: int,
     size: tuple[int, int],
     grid: tuple[int, int],
-) -> float:
-    if first is None or second is None:
-        return math.inf
-    dx = (first[0] - second[0]) / size[0] * grid[1]
-    dy = (first[1] - second[1]) / size[1] * grid[0]
-    return math.hypot(dx, dy)
+) -> list[list[float]]:
+    values = scores.float().view(*grid)
+    pooled = torch.nn.functional.max_pool2d(values[None, None], 3, stride=1, padding=1)[0, 0]
+    rows, columns = torch.meshgrid(
+        torch.arange(grid[0]), torch.arange(grid[1]), indexing="ij"
+    )
+    current_row, current_column = divmod(current, grid[1])
+    eligible = torch.maximum((rows - current_row).abs(), (columns - current_column).abs()) >= 4
+    available = eligible & (values >= pooled)
+    peaks = []
+    for _ in range(3):
+        index = int(values.masked_fill(~available, -torch.inf).argmax())
+        row, column = divmod(index, grid[1])
+        peaks.append((row, column))
+        available[max(0, row - 8) : row + 9, max(0, column - 8) : column + 9] = False
+    return [
+        [(column + 0.5) / grid[1] * size[0], (row + 0.5) / grid[0] * size[1]]
+        for row, column in peaks
+    ]
 
 
-def _medoid(candidates: dict[str, dict[str, Any]], size: tuple[int, int], grid: tuple[int, int]) -> str:
-    priority = {name: index for index, name in enumerate(("q0", "q1", "h0", "h1", "p0", "p1"))}
-    valid = {name: value["point"] for name, value in candidates.items() if value["point"] is not None}
-    def cost(name: str) -> tuple[float, int]:
-        point = valid[name]
-        total = sum(_token_distance(point, other, size, grid) for other in valid.values())
-        return total, priority[name]
-    return min(valid, key=cost)
+def _zscore(values: torch.Tensor) -> torch.Tensor:
+    return (values - values.mean()) / values.std(unbiased=False).clamp_min(1e-6)
 
 
 def _clone_cache(cache: DynamicCache) -> DynamicCache:
     return DynamicCache.from_legacy_cache(tuple((keys.clone(), values.clone()) for keys, values in cache.to_legacy_cache()))
-
-
-def _find_core(model: Any) -> Any:
-    for obj in _model_objects(model):
-        if hasattr(obj, "get_rope_index"):
-            return obj
-    raise RuntimeError("Qwen core was not found")
-
-
-def _find_config(model: Any) -> Any:
-    for obj in _model_objects(model):
-        config = getattr(obj, "config", None)
-        if config is not None and _value(config, "image_token_id") is not None:
-            return config
-    raise RuntimeError("Qwen vision config was not found")
-
-
-def _model_objects(model: Any):
-    seen, stack = set(), [model]
-    while stack:
-        obj = stack.pop()
-        if id(obj) in seen:
-            continue
-        seen.add(id(obj))
-        yield obj
-        stack.extend(child for name in ("module", "base_model", "model") if (child := getattr(obj, name, None)) is not None)
-
-
-def _value(config: Any, name: str, default: Any = None) -> Any:
-    return config.get(name, default) if isinstance(config, dict) else getattr(config, name, default)
