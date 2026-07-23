@@ -1,6 +1,6 @@
-# SelectGround
+# ClickContrast
 
-Official code and checkpoints for **Selection, Not Localization: Contrastive Training and Cross-View Likelihood for GUI Grounding**.
+Official **ClickContrast** data, SelectGround checkpoints, and CVL code for **Selection, Not Localization: Contrastive Training and Cross-View Likelihood for GUI Grounding**.
 
 SelectGround maps a screenshot and instruction to one click. It is trained with coordinate supervision and an element-aware target–distractor loss. CVL (Cross-View Likelihood) is its training-free test-time method: it augments the direct click with three separated attention peaks and four screen-covering predictions, restores detail with five fixed crops, and selects the coordinate assigned high likelihood by independent views.
 
@@ -21,8 +21,8 @@ CVL always executes one full-screen and five crop forward passes, then one deter
 The training results below were reproduced with Python 3.12, CUDA 12.8, and the pinned packages in `requirements.txt`.
 
 ```bash
-git clone https://github.com/zhangruotian/SelectGround.git
-cd SelectGround
+git clone https://github.com/zhangruotian/ClickContrast.git
+cd ClickContrast
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -79,7 +79,7 @@ Official benchmark pages: [ScreenSpot-Pro](https://huggingface.co/datasets/lscpk
 
 ## Train
 
-The released [SelectGround-Data](https://huggingface.co/datasets/ruotian/SelectGround-Data) contains the exact screenshots and annotations used by both fixed recipes: 3,790 target–distractor pairs and 3,790 replay examples. The 8B recipe additionally uses the included 502-pair final refinement set with 502 matched replay examples.
+The released [ClickContrast](https://huggingface.co/datasets/ruotian/ClickContrast) dataset contains 4,292 verified target–distractor pairs with matched ordinary grounding examples for replay: 3,790 pairs form the main split and 502 form the final refinement split.
 
 The 8B model was trained on two L40S GPUs. Its two stages must run as separate processes: phase A writes the adapter together with the optimizer, scheduler, and per-rank RNG states; phase B restores those states before using the refinement set. Combining the stages in one process changes gradient accumulation at dataloader boundaries and does not reproduce the model.
 
@@ -105,7 +105,7 @@ With the pinned environment, two independent 8B clean runs reached 64.39 and 64.
 
 - [SelectGround-8B](https://huggingface.co/ruotian/SelectGround-8B)
 - [SelectGround-30B-A3B](https://huggingface.co/ruotian/SelectGround-30B-A3B)
-- [SelectGround-Data](https://huggingface.co/datasets/ruotian/SelectGround-Data)
+- [ClickContrast](https://huggingface.co/datasets/ruotian/ClickContrast)
 
 The screenshots in the training repositories are the required subset of [Click-100K](https://huggingface.co/datasets/mlfoundations/Click-100k). Every example retains its upstream split and index.
 

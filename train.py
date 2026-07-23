@@ -26,7 +26,7 @@ RECIPES = {
     "8b": {
         "base": "Qwen/Qwen3-VL-8B-Instruct",
         "revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
-        "data": "ruotian/SelectGround-Data",
+        "data": "ruotian/ClickContrast",
         "steps": 135,
         "gpus": 2,
         "accumulation": 64,
@@ -35,7 +35,7 @@ RECIPES = {
     "30b": {
         "base": "Qwen/Qwen3-VL-30B-A3B-Instruct",
         "revision": "9c4b90e1e4ba969fd3b5378b57d966d725f1b86c",
-        "data": "ruotian/SelectGround-Data",
+        "data": "ruotian/ClickContrast",
         "steps": 200,
         "gpus": 4,
         "accumulation": 4,
