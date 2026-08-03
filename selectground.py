@@ -18,7 +18,6 @@ Return only one point as [x, y], where x and y are normalized integers from 0 to
 For an element with area, return the center point.
 Instruction: {instruction}"""
 
-
 class SelectGround:
     """SelectGround direct grounding and CVL test-time inference."""
 
@@ -67,13 +66,14 @@ class SelectGround:
     ) -> dict[str, Any]:
         source = Image.open(image).convert("RGB") if not isinstance(image, Image.Image) else image.convert("RGB")
         size = source.size
-        p0, full_view, raw_scores, grid = self._observe(
-            source,
-            size,
+        predictions, views, raw_scores, grid = self._observe(
+            [source],
+            [size],
             instruction,
-            box=(0, 0, size[0], size[1]),
+            boxes=[(0, 0, size[0], size[1])],
             capture_attention=cvl,
         )
+        p0, full_view = predictions[0], views[0]
         if not cvl:
             return {"method": "SelectGround", **p0}
 
@@ -94,10 +94,9 @@ class SelectGround:
             ([0.3 * width, 0.7 * height], 0.60),
             ([0.7 * width, 0.7 * height], 0.60),
         ]
-        observations = [
-            self._crop_view(source, instruction, anchor, fraction)
-            for anchor, fraction in proposals
-        ]
+        observations = self._crop_views(source, instruction, proposals[:1])
+        observations.extend(self._crop_views(source, instruction, proposals[1:3]))
+        observations.extend(self._crop_views(source, instruction, proposals[3:]))
         q0 = observations[0][0]
         grids = [observation[0] for observation in observations[1:]]
         top_predictions = [_point_prediction(point, size) for point in peaks]
@@ -118,33 +117,56 @@ class SelectGround:
             "raw_response": result["raw_response"],
         }
 
-    def _crop_view(
-        self, image: Image.Image, instruction: str, anchor: list[float], fraction: float
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        box = _crop_box(anchor, image.size, fraction)
-        crop = image.crop(box)
-        logical_size = crop.size
-        zoomed = crop.resize((2 * logical_size[0], 2 * logical_size[1]), Image.Resampling.LANCZOS)
-        direct, view, _, _ = self._observe(
+    def _crop_views(
+        self,
+        image: Image.Image,
+        instruction: str,
+        proposals: list[tuple[list[float], float]],
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        boxes = [_crop_box(anchor, image.size, fraction) for anchor, fraction in proposals]
+        crops = [image.crop(box) for box in boxes]
+        logical_sizes = [crop.size for crop in crops]
+        zoomed = [
+            crop.resize((2 * width, 2 * height), Image.Resampling.LANCZOS)
+            for crop, (width, height) in zip(crops, logical_sizes, strict=True)
+        ]
+        predictions, views, _, _ = self._observe(
             zoomed,
-            logical_size,
+            logical_sizes,
             instruction,
-            box=box,
+            boxes=boxes,
             capture_attention=False,
         )
-        mapped = _map_crop(direct, box, image.size)
-        return (mapped if mapped["point"] is not None else _point_prediction(anchor, image.size)), view
+        observations = []
+        for prediction, view, box, (anchor, _) in zip(
+            predictions, views, boxes, proposals, strict=True
+        ):
+            mapped = _map_crop(prediction, box, image.size)
+            observations.append(
+                (
+                    mapped
+                    if mapped["point"] is not None
+                    else _point_prediction(anchor, image.size),
+                    view,
+                )
+            )
+        return observations
 
     def _observe(
         self,
-        image: Image.Image,
-        logical_size: tuple[int, int],
+        images: list[Image.Image],
+        logical_sizes: list[tuple[int, int]],
         instruction: str,
         *,
-        box: tuple[int, int, int, int],
+        boxes: list[tuple[int, int, int, int]],
         capture_attention: bool,
-    ) -> tuple[dict[str, Any], dict[str, Any], torch.Tensor | None, tuple[int, int]]:
-        inputs = self._inputs(image, instruction)
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        torch.Tensor | None,
+        tuple[int, int],
+    ]:
+        inputs = self._inputs(images, instruction)
         input_ids = inputs["input_ids"]
         length = int(input_ids.shape[1])
         visual = torch.nonzero(input_ids[0] == self.image_token_id, as_tuple=False).flatten()
@@ -177,32 +199,64 @@ class SelectGround:
                 [value.float().cpu() for value in attention.ordered()]
             )
             raw_scores = layer_scores.mean(dim=(0, 1))
-        raw = self._decode(output.logits[:, -1, :], _clone_cache(cache), position_ids[:, :, -1:] + 1)
-        view = {
-            "box": box,
-            "logical_size": logical_size,
-            "initial_logits": output.logits[:, -1, :],
-            "cache": cache,
-            "position_ids": position_ids,
-        }
-        return _prediction(raw, logical_size), view, raw_scores, grid
+        raw = self._decode(
+            output.logits[:, -1, :],
+            _clone_cache(cache),
+            position_ids[:, :, -1:] + 1,
+            inputs["attention_mask"],
+        )
+        views = [
+            {
+                "box": box,
+                "logical_size": logical_size,
+                "batch_index": index,
+                "initial_logits": output.logits[:, -1, :],
+                "attention_mask": inputs["attention_mask"],
+                "cache": cache,
+                "position_ids": position_ids,
+            }
+            for index, (box, logical_size) in enumerate(
+                zip(boxes, logical_sizes, strict=True)
+            )
+        ]
+        predictions = [
+            _prediction(response, logical_size)
+            for response, logical_size in zip(raw, logical_sizes, strict=True)
+        ]
+        return predictions, views, raw_scores, grid
 
     @torch.inference_mode()
     def _score_responses(
-        self, view: dict[str, Any], responses: list[str]
-    ) -> dict[str, float]:
-        unique = list(dict.fromkeys(responses))
-        token_ids = [
-            self.processor.tokenizer(response, add_special_tokens=False)["input_ids"]
-            for response in unique
-        ]
+        self, views: list[dict[str, Any]], responses: list[list[str]]
+    ) -> list[dict[str, float]]:
+        records = []
+        for view_index, values in enumerate(responses):
+            for response in dict.fromkeys(values):
+                token_ids = self.processor.tokenizer(
+                    response, add_special_tokens=False
+                )["input_ids"]
+                records.append((view_index, response, token_ids))
+        if not records:
+            return [{} for _ in views]
+        token_ids = [record[2] for record in records]
         lengths = [len(values) for values in token_ids]
-        initial = torch.log_softmax(view["initial_logits"].detach().float(), dim=-1)[0]
-        logprobs = [[float(initial[values[0]])] for values in token_ids]
+        owners = torch.tensor(
+            [views[record[0]]["batch_index"] for record in records]
+        )
+        shared = views[0]
+        model_owners = owners.to(shared["initial_logits"].device)
+        initial = torch.log_softmax(
+            shared["initial_logits"].index_select(0, model_owners).detach().float(),
+            dim=-1,
+        )
+        logprobs = [
+            [float(initial[index, values[0]])]
+            for index, values in enumerate(token_ids)
+        ]
         max_length = max(lengths)
         if max_length > 1:
             tokenizer = self.processor.tokenizer
-            batch = len(unique)
+            batch = len(records)
             continuation = torch.full(
                 (batch, max_length - 1),
                 tokenizer.pad_token_id,
@@ -216,15 +270,13 @@ class SelectGround:
                     prefix, device=self.device
                 )
                 mask[index, : len(prefix)] = True
-            cache = _clone_cache(view["cache"])
-            cache.batch_repeat_interleave(batch)
-            prompt_length = view["cache"].get_seq_length()
+            cache = _clone_cache(shared["cache"])
+            cache.batch_select_indices(owners)
+            prompt_length = shared["cache"].get_seq_length()
             attention_mask = torch.cat(
                 (
-                    torch.ones(
-                        (batch, prompt_length),
-                        dtype=torch.long,
-                        device=self.device,
+                    shared["attention_mask"].index_select(
+                        0, owners.to(shared["attention_mask"].device)
                     ),
                     mask.long(),
                 ),
@@ -232,8 +284,12 @@ class SelectGround:
             )
             offsets = torch.arange(max_length - 1, device=self.device).view(1, 1, -1)
             position_ids = (
-                view["position_ids"][:, :, -1:] + 1 + offsets
-            ).expand(-1, batch, -1)
+                shared["position_ids"].index_select(
+                    1, owners.to(shared["position_ids"].device)
+                )[:, :, -1:]
+                + 1
+                + offsets
+            )
             output = self.model(
                 input_ids=continuation,
                 past_key_values=cache,
@@ -256,10 +312,10 @@ class SelectGround:
                     1, labels[:, None]
                 )[:, 0]
                 logprobs[index].extend(float(value) for value in selected.cpu())
-        return {
-            response: sum(values) / len(values)
-            for response, values in zip(unique, logprobs, strict=True)
-        }
+        scores = [{} for _ in views]
+        for (view_index, response, _), values in zip(records, logprobs, strict=True):
+            scores[view_index][response] = sum(values) / len(values)
+        return scores
 
     def _cvl_select(
         self,
@@ -268,7 +324,8 @@ class SelectGround:
         source_views: list[int],
         size: tuple[int, int],
     ) -> int:
-        per_view = []
+        local_points = []
+        responses = []
         for view in views:
             box = view["box"]
             local = [
@@ -279,12 +336,22 @@ class SelectGround:
                 )
                 for point in points
             ]
-            responses = [
-                _point_response(point, view["logical_size"])
+            local_points.append(local)
+            responses.append([
+                self._point_response(point, view["logical_size"])
                 for point in local
                 if point is not None
-            ]
-            scores = self._score_responses(view, responses)
+            ])
+        score_maps = self._score_responses(views[:1], responses[:1])
+        score_maps.extend(self._score_responses(views[1:2], responses[1:2]))
+        score_maps.extend(self._score_responses(views[2:4], responses[2:4]))
+        score_maps.extend(self._score_responses(views[4:], responses[4:]))
+
+        per_view = []
+        for view, local, scores in zip(views, local_points, score_maps, strict=True):
+            if not scores:
+                per_view.append([None] * len(local))
+                continue
             unique = torch.tensor(list(scores.values()), dtype=torch.float32)
             normalized = {
                 response: float(value)
@@ -296,22 +363,29 @@ class SelectGround:
             }
             per_view.append(
                 [
-                    normalized[_point_response(point, view["logical_size"])]
+                    normalized[self._point_response(point, view["logical_size"])]
                     if point is not None
                     else None
                     for point in local
                 ]
             )
 
-        cross = []
+        cross: list[float | None] = []
         for candidate, source_view in enumerate(source_views):
             evidence = [
                 values[candidate]
                 for view_index, values in enumerate(per_view)
                 if view_index != source_view and values[candidate] is not None
             ]
-            cross.append(sum(evidence) / len(evidence))
-        cross_score = _zscore(torch.tensor(cross, dtype=torch.float32))
+            cross.append(sum(evidence) / len(evidence) if evidence else None)
+        valid = [index for index, value in enumerate(cross) if value is not None]
+        if not valid:
+            return 1
+        normalized_cross = _zscore(
+            torch.tensor([cross[index] for index in valid], dtype=torch.float32)
+        )
+        cross_score = torch.full((len(cross),), -torch.inf, dtype=torch.float32)
+        cross_score[valid] = normalized_cross
         normalized_points = torch.tensor(
             [[point[0] / size[0], point[1] / size[1]] for point in points],
             dtype=torch.float32,
@@ -322,46 +396,84 @@ class SelectGround:
         return int(score.argmax())
 
     @torch.inference_mode()
-    def _decode(self, logits: torch.Tensor, cache: DynamicCache, position_ids: torch.Tensor) -> str:
+    def _decode(
+        self,
+        logits: torch.Tensor,
+        cache: DynamicCache,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> list[str]:
         stop = {
             int(token)
             for token in (self.processor.tokenizer.eos_token_id, self.processor.tokenizer.pad_token_id)
             if token is not None
         }
-        generated = []
+        batch = logits.shape[0]
+        generated = [[] for _ in range(batch)]
+        active = torch.ones(batch, dtype=torch.bool, device=logits.device)
         for _ in range(32):
             token = logits.argmax(dim=-1)
-            generated.append(int(token))
-            if generated[-1] in stop:
+            for index in torch.nonzero(active, as_tuple=False).flatten().tolist():
+                generated[index].append(int(token[index]))
+            active &= ~torch.isin(
+                token, torch.tensor(list(stop), device=token.device)
+            )
+            if not active.any():
                 break
+            token = token.masked_fill(~active, self.processor.tokenizer.pad_token_id)
+            kwargs = {}
+            if batch > 1:
+                attention_mask = torch.cat((attention_mask, active[:, None]), dim=1)
+                kwargs["attention_mask"] = attention_mask
             output = self.model(
-                input_ids=token.view(1, 1),
+                input_ids=token.view(batch, 1),
                 past_key_values=cache,
                 position_ids=position_ids,
                 cache_position=torch.tensor([cache.get_seq_length()], device=token.device),
                 use_cache=True,
                 logits_to_keep=1,
+                **kwargs,
             )
             cache = output.past_key_values
             logits = output.logits[:, -1, :]
             position_ids = position_ids + 1
-        return self.processor.decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
+        return [
+            self.processor.decode(
+                values,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+            for values in generated
+        ]
 
-    def _inputs(self, image: Image.Image, instruction: str) -> Any:
+    def _inputs(self, images: list[Image.Image], instruction: str) -> Any:
         from qwen_vl_utils import process_vision_info
 
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": PROMPT.format(instruction=instruction)},
-            ],
-        }]
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        images, _ = process_vision_info(messages)
+        conversations = []
+        for image in images:
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": PROMPT.format(instruction=instruction)},
+                ],
+            }]
+            conversations.append(messages)
+        text = [
+            self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            for messages in conversations
+        ]
+        image_inputs, _ = process_vision_info(
+            conversations
+        )
         return self.processor(
-            text=[text], images=images, padding=True, return_tensors="pt"
+            text=text, images=image_inputs, padding=True, return_tensors="pt"
         ).to(self.device)
+
+    def _point_response(self, point: list[float], size: tuple[int, int]) -> str:
+        return _point_response(point, size)
 
 
 class _Attention:

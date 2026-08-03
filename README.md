@@ -14,7 +14,7 @@ SelectGround maps a screenshot and instruction to one click. It is trained with 
 | SelectGround-30B-A3B | + CVL | **73.69** | **47.08** | **75.69** |
 
 UI-Vision is the equal-weight mean of its basic, functional, and spatial element-grounding subsets. OSWorld-G uses the 510 target-bearing examples and excludes 54 refusal examples.
-CVL always executes one full-screen and five crop forward passes, then one deterministic argmax. Each checkpoint uses one fixed parameter pair unchanged across all three benchmarks; inference uses no UI parser, correctness signal, gate, or route.
+CVL evaluates one full-screen and five crop views, then applies one deterministic argmax. The full-screen and direct-centered crop run separately; the four coverage crops run as two fixed batches. Coordinate scoring uses the same batching, reducing model forward calls from 12 to 8 without changing CVL's views, candidates, scores, or selection rule. Each checkpoint uses one fixed parameter pair unchanged across all three benchmarks; inference uses no UI parser, correctness signal, gate, or route.
 
 ## Install
 
