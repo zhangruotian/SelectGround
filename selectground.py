@@ -19,7 +19,7 @@ For an element with area, return the center point.
 Instruction: {instruction}"""
 
 class SelectGround:
-    """SelectGround direct grounding and CVL test-time inference."""
+    """SelectGround direct grounding and LCR test-time inference."""
 
     def __init__(self, checkpoint: str = "ruotian/SelectGround-8B") -> None:
         checkpoint_path = Path(checkpoint)
@@ -28,8 +28,8 @@ class SelectGround:
         adapter_config = json.loads((checkpoint_path / "adapter_config.json").read_text())
         base_model = adapter_config["base_model_name_or_path"]
         revision = adapter_config["revision"]
-        self.cvl_proximity_weight = 0.0 if "30B" in base_model else 0.5
-        self.cvl_q0_weight = 0.5 if "30B" in base_model else 0.0
+        self.lcr_proximity_weight = 0.0 if "30B" in base_model else 0.5
+        self.lcr_q0_weight = 0.5 if "30B" in base_model else 0.0
         model = AutoModelForImageTextToText.from_pretrained(
             base_model,
             revision=revision,
@@ -62,7 +62,7 @@ class SelectGround:
         image: str | Path | Image.Image,
         instruction: str,
         *,
-        cvl: bool = False,
+        lcr: bool = False,
     ) -> dict[str, Any]:
         source = Image.open(image).convert("RGB") if not isinstance(image, Image.Image) else image.convert("RGB")
         size = source.size
@@ -71,10 +71,10 @@ class SelectGround:
             [size],
             instruction,
             boxes=[(0, 0, size[0], size[1])],
-            capture_attention=cvl,
+            capture_attention=lcr,
         )
         p0, full_view = predictions[0], views[0]
-        if not cvl:
+        if not lcr:
             return {"method": "SelectGround", **p0}
 
         if p0["point"] is None:
@@ -103,7 +103,7 @@ class SelectGround:
         predictions = [p0, q0, *top_predictions, *grids]
         points = [prediction["point"] for prediction in predictions]
         source_views = [0, 1, 0, 0, 0, 2, 3, 4, 5]
-        selected = self._cvl_select(
+        selected = self._lcr_select(
             points,
             [full_view, *(view for _, view in observations)],
             source_views,
@@ -111,7 +111,7 @@ class SelectGround:
         )
         result = predictions[selected]
         return {
-            "method": "SelectGround+CVL",
+            "method": "SelectGround+LCR",
             "point": result["point"],
             "normalized_point": result["normalized_point"],
             "raw_response": result["raw_response"],
@@ -317,7 +317,7 @@ class SelectGround:
             scores[view_index][response] = sum(values) / len(values)
         return scores
 
-    def _cvl_select(
+    def _lcr_select(
         self,
         points: list[list[float]],
         views: list[dict[str, Any]],
@@ -391,8 +391,8 @@ class SelectGround:
             dtype=torch.float32,
         )
         proximity = _zscore(-torch.cdist(normalized_points, normalized_points)[:, 1])
-        score = cross_score + self.cvl_proximity_weight * proximity
-        score[1] += self.cvl_q0_weight
+        score = cross_score + self.lcr_proximity_weight * proximity
+        score[1] += self.lcr_q0_weight
         return int(score.argmax())
 
     @torch.inference_mode()
@@ -532,6 +532,29 @@ def _attention_logits(
         )
     visual = keys.index_select(2, visual_positions.to(keys.device))
     return ((queries[:, :, query_position, :].unsqueeze(2) * visual).sum(-1) * attention.scaling)[0]
+
+
+def _find_config(model: Any) -> Any:
+    for obj in _model_objects(model):
+        config = getattr(obj, "config", None)
+        if config is not None and _value(config, "image_token_id") is not None:
+            return config
+    raise RuntimeError("Qwen vision config was not found")
+
+
+def _model_objects(model: Any):
+    seen, stack = set(), [model]
+    while stack:
+        obj = stack.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        yield obj
+        stack.extend(child for name in ("module", "base_model", "model") if (child := getattr(obj, name, None)) is not None)
+
+
+def _value(config: Any, name: str, default: Any = None) -> Any:
+    return config.get(name, default) if isinstance(config, dict) else getattr(config, name, default)
 
 
 def _prediction(raw: str, size: tuple[int, int]) -> dict[str, Any]:

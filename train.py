@@ -365,23 +365,23 @@ def main() -> None:
     optimizer.zero_grad(set_to_none=True)
     while completed < target:
         active_loaders, active_iterators = (pair_loader, replay_loader), iterators
-        semantic = micro_step % 2 == 1
-        index = 0 if semantic else 1
+        competitor_paired = micro_step % 2 == 1
+        index = 0 if competitor_paired else 1
         row, active_iterators[index] = next_row(active_loaders[index], active_iterators[index])
         with accelerator.accumulate(model, selector):
             inputs, labels, query = encode(processor, row, accelerator.device)
             visual = torch.nonzero(inputs["input_ids"][0] == int(_value(config, "image_token_id")), as_tuple=False).flatten()
             keep = int(labels.ne(-100).sum()) + 1
-            context = Attention(model, query, visual) if semantic else nullcontext()
+            context = Attention(model, query, visual) if competitor_paired else nullcontext()
             with context as attention:
                 output = model(**inputs, use_cache=False, logits_to_keep=keep)
-                if semantic:
+                if competitor_paired:
                     scores = selector(attention.ordered())
-                    semantic_loss = selection_loss(scores, row, inputs["image_grid_thw"][0], config)
+                    selection_term = selection_loss(scores, row, inputs["image_grid_thw"][0], config)
                 else:
-                    semantic_loss = output.logits.sum() * 0
+                    selection_term = output.logits.sum() * 0
                 coord_loss = coordinate_loss(output.logits, inputs["input_ids"], labels)
-                loss = coord_loss + .1 * semantic_loss
+                loss = coord_loss + .1 * selection_term
                 accelerator.backward(loss)
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(list(model.parameters()) + list(selector.parameters()), 1.0)
@@ -392,7 +392,7 @@ def main() -> None:
         if accelerator.sync_gradients:
             completed += 1
             if accelerator.is_main_process:
-                print(f"step={completed} loss={float(loss):.4f} coord={float(coord_loss):.4f} selection={float(semantic_loss):.4f}", flush=True)
+                print(f"step={completed} loss={float(loss):.4f} coord={float(coord_loss):.4f} selection={float(selection_term):.4f}", flush=True)
     save(
         accelerator,
         model,

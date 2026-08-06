@@ -1,20 +1,20 @@
 # ClickContrast
 
-Official **ClickContrast** data, SelectGround checkpoints, and CVL code for **Selection, Not Localization: Contrastive Training and Cross-View Likelihood for GUI Grounding**.
+Official **ClickContrast** data, SelectGround checkpoints, and LCR code for **Selection, Not Localization: Observed and Latent Competition in GUI Grounding**.
 
-SelectGround maps a screenshot and instruction to one click. It is trained with coordinate supervision and an element-aware target–distractor loss. CVL (Cross-View Likelihood) is its training-free test-time method: it augments the direct click with three separated attention peaks and four screen-covering predictions, restores detail with five fixed crops, and selects the coordinate assigned high likelihood by independent views.
+SelectGround maps a screenshot and instruction to one click. It learns from observed competitors through coordinate supervision and a competitor-aware selection loss. LCR (Latent Competitor Revisit) is its training-free test-time method: it treats the direct click as the incumbent, reconstructs latent competitors from three separated compatibility peaks and four screen-covering predictions, restores detail with five fixed crops, and reselects using cross-view coordinate evidence derived from native teacher-forced likelihood.
 
 ## Results
 
 | Model | Inference | ScreenSpot-Pro | UI-Vision | OSWorld-G |
 |---|---|---:|---:|---:|
 | SelectGround-8B | Direct | 64.96 | 38.68 | 70.00 |
-| SelectGround-8B | + CVL | **72.36** | **45.10** | **72.55** |
+| SelectGround-8B | + LCR | **72.36** | **45.10** | **72.55** |
 | SelectGround-30B-A3B | Direct | 65.91 | 38.69 | 72.35 |
-| SelectGround-30B-A3B | + CVL | **73.69** | **47.08** | **75.69** |
+| SelectGround-30B-A3B | + LCR | **73.69** | **47.08** | **75.69** |
 
 UI-Vision is the equal-weight mean of its basic, functional, and spatial element-grounding subsets. OSWorld-G uses the 510 target-bearing examples and excludes 54 refusal examples.
-CVL evaluates one full-screen and five crop views, then applies one deterministic argmax. The full-screen and direct-centered crop run separately; the four coverage crops run as two fixed batches. Coordinate scoring uses the same batching, reducing model forward calls from 12 to 8 without changing CVL's views, candidates, scores, or selection rule. Each checkpoint uses one fixed parameter pair unchanged across all three benchmarks; inference uses no UI parser, correctness signal, gate, or route.
+LCR evaluates one full-screen and five crop views, then applies one deterministic reselection. The full-screen and incumbent-centered crop run separately; the four coverage crops run as two fixed batches. Coordinate scoring uses the same batching, reducing model forward calls from 12 to 8 without changing LCR's views, candidates, evidence, or selection rule. Each checkpoint uses one fixed parameter pair unchanged across all three benchmarks; inference uses no UI parser, correctness signal, gate, or route.
 
 ## Install
 
@@ -42,14 +42,14 @@ python infer.py \
   --instruction "Click the Save button"
 ```
 
-SelectGround + CVL:
+SelectGround + LCR:
 
 ```bash
 python infer.py \
   --model ruotian/SelectGround-8B \
   --image screenshot.png \
   --instruction "Click the Save button" \
-  --cvl
+  --lcr
 ```
 
 Use `ruotian/SelectGround-30B-A3B` for the 30B-A3B checkpoint. The returned `point` is in source-image pixels; `normalized_point` uses the `[0,1000]` coordinate system.
@@ -65,12 +65,12 @@ git clone https://github.com/xlang-ai/OSWorld-G.git data/OSWorld-G
 git -C data/OSWorld-G checkout daa6bd8e0e629f0917ad2984df930bf0bd967540
 ```
 
-Run direct inference or append `--cvl`:
+Run direct inference or append `--lcr`:
 
 ```bash
-python evaluate.py --model ruotian/SelectGround-8B --benchmark screenspot_pro --data data/screenspot-pro --output outputs/ssp.jsonl --cvl
-python evaluate.py --model ruotian/SelectGround-8B --benchmark ui_vision --data data/ui-vision --output outputs/uiv.jsonl --cvl
-python evaluate.py --model ruotian/SelectGround-8B --benchmark osworld_g --data data/OSWorld-G --output outputs/osw.jsonl --cvl
+python evaluate.py --model ruotian/SelectGround-8B --benchmark screenspot_pro --data data/screenspot-pro --output outputs/ssp.jsonl --lcr
+python evaluate.py --model ruotian/SelectGround-8B --benchmark ui_vision --data data/ui-vision --output outputs/uiv.jsonl --lcr
+python evaluate.py --model ruotian/SelectGround-8B --benchmark osworld_g --data data/OSWorld-G --output outputs/osw.jsonl --lcr
 ```
 
 The evaluator appends one result at a time and resumes from an existing output file.
@@ -79,7 +79,7 @@ Official benchmark pages: [ScreenSpot-Pro](https://huggingface.co/datasets/lscpk
 
 ## Train
 
-The released [ClickContrast](https://huggingface.co/datasets/ruotian/ClickContrast) dataset contains 4,292 verified target–distractor pairs with matched ordinary grounding examples for replay: 3,790 pairs form the main split and 502 form the final refinement split.
+The released [ClickContrast](https://huggingface.co/datasets/ruotian/ClickContrast) dataset contains 4,292 verified model-induced target–competitor pairs with matched coverage grounding examples for replay: 3,790 pairs form the main split and 502 form the final refinement split.
 
 The 8B model was trained on two L40S GPUs. Its two stages must run as separate processes: phase A writes the adapter together with the optimizer, scheduler, and per-rank RNG states; phase B restores those states before using the refinement set. Combining the stages in one process changes gradient accumulation at dataloader boundaries and does not reproduce the model.
 
@@ -97,7 +97,7 @@ The 30B-A3B model was trained in one stage on four 80 GB A100 GPUs:
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --mixed_precision bf16 --num_processes 4 train.py --model 30b --output outputs/SelectGround-30B-A3B
 ```
 
-Training is standard LoRA SFT. On mined examples, the loss additionally ranks the target region above the verified distractor and three hard UI regions. Direct inference remains ordinary coordinate decoding, while CVL compares a fixed candidate set through the model's native coordinate likelihood without additional training.
+Training is standard LoRA SFT. On competitor-paired examples, the loss additionally ranks the target region above the verified distractor and three hard UI regions. Direct inference remains ordinary coordinate decoding, while LCR reconstructs latent competitors, restores evidence in fixed enlarged views, and reselects through the model's native teacher-forced coordinate likelihood without additional training.
 
 With the pinned environment, two independent 8B clean runs reached 64.39 and 64.64 on ScreenSpot-Pro; one was also evaluated at 39.17 on UI-Vision and 69.02 on OSWorld-G. Independent 30B-A3B clean runs reached 64.20--64.83 on ScreenSpot-Pro, 38.57--38.90 on UI-Vision, and 70.98--71.76 on OSWorld-G. Small run-to-run differences remain across GPU nodes because the training kernels are not bitwise deterministic.
 
@@ -113,7 +113,7 @@ The screenshots in the training repositories are the required subset of [Click-1
 
 ```bibtex
 @article{selectground2026,
-  title={Selection, Not Localization: Contrastive Training and Cross-View Likelihood for GUI Grounding},
+  title={Selection, Not Localization: Observed and Latent Competition in GUI Grounding},
   author={Anonymous},
   year={2026}
 }
