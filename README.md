@@ -11,6 +11,7 @@ SelectGround maps a screenshot and instruction to one click. It learns from obse
 | SelectGround-8B | Direct | 64.96 | 38.68 | 70.00 |
 | SelectGround-8B | + LCR | **71.22** | **43.02** | **71.96** |
 | SelectGround-30B-A3B | Direct | 65.91 | 38.69 | 72.35 |
+| SelectGround-30B-A3B | + LCR | **67.24** | **41.69** | **72.55** |
 
 UI-Vision is the equal-weight mean of its basic, functional, and spatial element-grounding subsets. OSWorld-G uses the 510 target-bearing examples and excludes 54 refusal examples.
 LCR uses at most four greedy visual generations: the full screenshot, one fixed-budget incumbent crop, and two attention-guided crops proposed from the retained full-screen state. Its final readout compares only the six pairwise normalized coordinate distances; attention coverage is used only to choose crops. It uses no UI parser, correctness signal, confidence threshold, teacher-forced scorer, gate, or route.
@@ -51,6 +52,8 @@ python infer.py \
   --instruction "Click the Save button" \
   --lcr
 ```
+
+Use `--model ruotian/SelectGround-30B-A3B` to run the same LCR inference with the 30B-A3B checkpoint.
 
 The returned `point` is in source-image pixels; `normalized_point` uses the `[0,1000]` coordinate system.
 

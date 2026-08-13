@@ -61,9 +61,6 @@ class SelectGround:
         self.vision_start_token_id = int(self.core.config.vision_start_token_id)
         self.vision_end_token_id = int(self.core.config.vision_end_token_id)
         self.merge_size = int(self.core.config.vision_config.spatial_merge_size)
-        self.comma_token_id = int(
-            self.processor.tokenizer(",", add_special_tokens=False)["input_ids"][0]
-        )
 
     def predict(
         self,
@@ -81,9 +78,16 @@ class SelectGround:
         )
         if not lcr:
             return {"method": "SelectGround", **p0}
+        if p0["point"] is None:
+            return {"method": "SelectGround+LCR", **p0}
 
+        attention_boxes = (
+            _attention_crops(attention, grid, size, benchmark)
+            if attention is not None
+            else []
+        )
         views = [
-            *((box, 2.0) for box in _attention_crops(attention, grid, size, benchmark)),
+            *((box, 2.0) for box in attention_boxes),
             (_pixel_budget_crop(p0["point"], size, 501_760), 1.5),
         ]
         observations = [(p0, (0, 0, size[0], size[1]))]
@@ -96,6 +100,8 @@ class SelectGround:
             prediction, _, _ = self._observe(view, instruction, lcr_prompt=True)
             if prediction["point"] is not None:
                 observations.append((_map_crop(prediction, box, size, scale), box))
+        if len(observations) == 1:
+            return {"method": "SelectGround+LCR", **p0}
         first, second = min(
             combinations(range(len(observations)), 2),
             key=lambda pair: (
@@ -191,7 +197,8 @@ class SelectGround:
             if token in stop:
                 break
             generated.append(token)
-            if attention is not None and token == self.comma_token_id:
+            token_text = self.processor.decode([token])
+            if attention is not None and ("," in token_text or "，" in token_text):
                 attention.install(cache)
             try:
                 output = self.model(
@@ -329,7 +336,12 @@ class _Attention:
 def _prediction(
     raw: str, size: tuple[int, int], *, integer: bool = False
 ) -> dict[str, Any]:
-    match = re.search(r"[\[(]\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*[\])]", raw)
+    match = re.search(
+        r"[\[(（]\s*(?:x\s*=\s*)?(-?\d+(?:\.\d+)?)\s*[,，]\s*"
+        r"(?:y\s*=\s*)?(-?\d+(?:\.\d+)?)\s*[\])）]",
+        raw,
+        flags=re.IGNORECASE,
+    )
     normalized = [float(match.group(1)), float(match.group(2))] if match else None
     point = [normalized[0] / 1000 * size[0], normalized[1] / 1000 * size[1]] if normalized else None
     if point is not None and integer:
