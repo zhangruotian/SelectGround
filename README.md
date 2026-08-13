@@ -2,19 +2,19 @@
 
 Official **ClickContrast** data, SelectGround checkpoints, and LCR code for **Selection, Not Localization: Observed and Latent Competition in GUI Grounding**.
 
-SelectGround maps a screenshot and instruction to one click. It learns from observed competitors through coordinate supervision and a competitor-aware selection loss. LCR (Latent Competitor Revisit) is its training-free test-time method: it treats the direct click as the incumbent, reconstructs latent competitors from three separated compatibility peaks and four screen-covering predictions, restores detail with five fixed crops, and reselects using cross-view coordinate evidence derived from native teacher-forced likelihood.
+SelectGround maps a screenshot and instruction to one click. It learns from observed competitors through coordinate supervision and a competitor-aware selection loss. LCR (Latent Competitor Revisit) is its training-free test-time method: it treats the direct click as the incumbent, decodes two attention-guided latent competitor views, independently revisits the incumbent at higher resolution, and returns the higher-resolution endpoint of the closest cross-view coordinate pair.
 
 ## Results
 
 | Model | Inference | ScreenSpot-Pro | UI-Vision | OSWorld-G |
 |---|---|---:|---:|---:|
 | SelectGround-8B | Direct | 64.96 | 38.68 | 70.00 |
-| SelectGround-8B | + LCR | **72.36** | **45.10** | **72.55** |
+| SelectGround-8B | + LCR | **71.22** | **43.02** | **71.96** |
 | SelectGround-30B-A3B | Direct | 65.91 | 38.69 | 72.35 |
-| SelectGround-30B-A3B | + LCR | **73.69** | **47.08** | **75.69** |
 
 UI-Vision is the equal-weight mean of its basic, functional, and spatial element-grounding subsets. OSWorld-G uses the 510 target-bearing examples and excludes 54 refusal examples.
-LCR evaluates one full-screen and five crop views, then applies one deterministic reselection. The full-screen and incumbent-centered crop run separately; the four coverage crops run as two fixed batches. Coordinate scoring uses the same batching, reducing model forward calls from 12 to 8 without changing LCR's views, candidates, evidence, or selection rule. Each checkpoint uses one fixed parameter pair unchanged across all three benchmarks; inference uses no UI parser, correctness signal, gate, or route.
+LCR uses at most four greedy visual generations: the full screenshot, one fixed-budget incumbent crop, and two attention-guided crops proposed from the retained full-screen state. Its final readout compares only the six pairwise normalized coordinate distances; attention coverage is used only to choose crops. It uses no UI parser, correctness signal, confidence threshold, teacher-forced scorer, gate, or route.
+The LCR results use its released paired inference prompt, so its full-screen incumbent is not the Direct row above, which uses the default SelectGround prompt.
 
 ## Install
 
@@ -52,7 +52,7 @@ python infer.py \
   --lcr
 ```
 
-Use `ruotian/SelectGround-30B-A3B` for the 30B-A3B checkpoint. The returned `point` is in source-image pixels; `normalized_point` uses the `[0,1000]` coordinate system.
+The returned `point` is in source-image pixels; `normalized_point` uses the `[0,1000]` coordinate system.
 
 ## Benchmarks
 
@@ -97,7 +97,7 @@ The 30B-A3B model was trained in one stage on four 80 GB A100 GPUs:
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --mixed_precision bf16 --num_processes 4 train.py --model 30b --output outputs/SelectGround-30B-A3B
 ```
 
-Training is standard LoRA SFT. On competitor-paired examples, the loss additionally ranks the target region above the verified distractor and three hard UI regions. Direct inference remains ordinary coordinate decoding, while LCR reconstructs latent competitors, restores evidence in fixed enlarged views, and reselects through the model's native teacher-forced coordinate likelihood without additional training.
+Training is standard LoRA SFT. On competitor-paired examples, the loss additionally ranks the target region above the verified distractor and three hard UI regions. Direct inference remains ordinary coordinate decoding, while LCR reconstructs latent competitors in enlarged views and reconsiders the incumbent through cross-view coordinate consistency without additional training.
 
 With the pinned environment, two independent 8B clean runs reached 64.39 and 64.64 on ScreenSpot-Pro; one was also evaluated at 39.17 on UI-Vision and 69.02 on OSWorld-G. Independent 30B-A3B clean runs reached 64.20--64.83 on ScreenSpot-Pro, 38.57--38.90 on UI-Vision, and 70.98--71.76 on OSWorld-G. Small run-to-run differences remain across GPU nodes because the training kernels are not bitwise deterministic.
 

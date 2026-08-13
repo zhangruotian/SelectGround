@@ -138,7 +138,12 @@ with args.output.open("a") as output:
     for number, case in enumerate(cases, 1):
         if case["id"] in done:
             continue
-        prediction = grounder.predict(case["image"], case["instruction"], lcr=args.lcr)
+        prediction = grounder.predict(
+            case["image"],
+            case["instruction"],
+            lcr=args.lcr,
+            benchmark=args.benchmark,
+        )
         row = {
             "id": case["id"],
             "instruction": case["instruction"],
