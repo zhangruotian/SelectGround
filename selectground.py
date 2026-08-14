@@ -61,6 +61,7 @@ class SelectGround:
         self.vision_start_token_id = int(self.core.config.vision_start_token_id)
         self.vision_end_token_id = int(self.core.config.vision_end_token_id)
         self.merge_size = int(self.core.config.vision_config.spatial_merge_size)
+        self.large_lcr = len(self.core.language_model.layers) > 36
 
     def predict(
         self,
@@ -74,7 +75,10 @@ class SelectGround:
         source = Image.open(image).convert("RGB") if not isinstance(image, Image.Image) else image.convert("RGB")
         size = source.size
         p0, attention, grid = self._observe(
-            source, instruction, capture_attention=lcr, lcr_prompt=lcr
+            source,
+            instruction,
+            capture_attention=lcr,
+            lcr_prompt=lcr and not self.large_lcr,
         )
         if not lcr:
             return {"method": "SelectGround", **p0}
@@ -86,18 +90,27 @@ class SelectGround:
             if attention is not None
             else []
         )
-        views = [
-            *((box, 2.0) for box in attention_boxes),
-            (_pixel_budget_crop(p0["point"], size, 501_760), 1.5),
-        ]
+        if self.large_lcr:
+            views = [
+                *((box, 2.0) for box in attention_boxes[:1]),
+                (_fraction_crop(p0["point"], size, 0.25, 256), 2.5),
+                (_fraction_crop(p0["point"], size, 0.40, 320), 2.0),
+            ]
+        else:
+            views = [
+                *((box, 2.0) for box in attention_boxes),
+                (_pixel_budget_crop(p0["point"], size, 501_760), 1.5),
+            ]
         observations = [(p0, (0, 0, size[0], size[1]))]
         for box, scale in views:
             crop = source.crop(box)
             view = crop.resize(
                 (round(crop.width * scale), round(crop.height * scale)),
-                Image.Resampling.BICUBIC,
+                Image.Resampling.LANCZOS if self.large_lcr else Image.Resampling.BICUBIC,
             )
-            prediction, _, _ = self._observe(view, instruction, lcr_prompt=True)
+            prediction, _, _ = self._observe(
+                view, instruction, lcr_prompt=not self.large_lcr
+            )
             if prediction["point"] is not None:
                 observations.append((_map_crop(prediction, box, size, scale), box))
         if len(observations) == 1:
@@ -294,7 +307,8 @@ class _Attention:
 
     def install(self, cache: DynamicCache) -> None:
         self.cache = cache
-        layer = self.model.language_model.layers[24].self_attn
+        layers = self.model.language_model.layers
+        layer = layers[2 * len(layers) // 3].self_attn
         self.handle = layer.register_forward_hook(self._hook, with_kwargs=True)
 
     def remove(self) -> None:
@@ -369,6 +383,20 @@ def _pixel_budget_crop(
     fraction = min(1.0, math.sqrt(pixels / (width * height)))
     crop_width = max(1, round(fraction * width))
     crop_height = max(1, round(fraction * height))
+    left = round(min(max(0.0, point[0] - crop_width / 2), width - crop_width))
+    top = round(min(max(0.0, point[1] - crop_height / 2), height - crop_height))
+    return left, top, left + crop_width, top + crop_height
+
+
+def _fraction_crop(
+    point: list[float],
+    size: tuple[int, int],
+    fraction: float,
+    minimum: int,
+) -> tuple[int, int, int, int]:
+    width, height = size
+    crop_width = min(width, max(minimum, round(fraction * width)))
+    crop_height = min(height, max(minimum, round(fraction * height)))
     left = round(min(max(0.0, point[0] - crop_width / 2), width - crop_width))
     top = round(min(max(0.0, point[1] - crop_height / 2), height - crop_height))
     return left, top, left + crop_width, top + crop_height

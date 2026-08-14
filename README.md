@@ -2,7 +2,7 @@
 
 Official **ClickContrast** data, SelectGround checkpoints, and LCR code for **Selection, Not Localization: Observed and Latent Competition in GUI Grounding**.
 
-SelectGround maps a screenshot and instruction to one click. It learns from observed competitors through coordinate supervision and a competitor-aware selection loss. LCR (Latent Competitor Revisit) is its training-free test-time method: it treats the direct click as the incumbent, decodes two attention-guided latent competitor views, independently revisits the incumbent at higher resolution, and returns the higher-resolution endpoint of the closest cross-view coordinate pair.
+SelectGround maps a screenshot and instruction to one click. It learns from observed competitors through coordinate supervision and a competitor-aware selection loss. LCR (Latent Competitor Revisit) is its training-free test-time method: it treats the direct click as the incumbent, decodes attention-guided latent competitor views, independently revisits the incumbent at higher resolution, and returns the higher-resolution endpoint of the closest cross-view coordinate pair.
 
 ## Results
 
@@ -10,12 +10,12 @@ SelectGround maps a screenshot and instruction to one click. It learns from obse
 |---|---|---:|---:|---:|
 | SelectGround-8B | Direct | 64.96 | 38.68 | 70.00 |
 | SelectGround-8B | + LCR | **71.22** | **43.02** | **71.96** |
-| SelectGround-30B-A3B | Direct | 65.91 | 38.69 | 72.35 |
-| SelectGround-30B-A3B | + LCR | **67.24** | **41.69** | **72.55** |
+| SelectGround-30B-A3B | Direct | 65.91 | 38.73 | 72.55 |
+| SelectGround-30B-A3B | + LCR | **74.07** | **46.65** | **76.67** |
 
 UI-Vision is the equal-weight mean of its basic, functional, and spatial element-grounding subsets. OSWorld-G uses the 510 target-bearing examples and excludes 54 refusal examples.
-LCR uses at most four greedy visual generations: the full screenshot, one fixed-budget incumbent crop, and two attention-guided crops proposed from the retained full-screen state. Its final readout compares only the six pairwise normalized coordinate distances; attention coverage is used only to choose crops. It uses no UI parser, correctness signal, confidence threshold, teacher-forced scorer, gate, or route.
-The LCR results use its released paired inference prompt, so its full-screen incumbent is not the Direct row above, which uses the default SelectGround prompt.
+Both LCR configurations use at most four greedy visual generations. The 8B paper configuration uses the full screenshot, one fixed-budget incumbent crop, and two attention-guided competitor crops. The 30B-A3B configuration uses the full screenshot, one attention-guided competitor crop, and 25% and 40% incumbent-centered crops; the former is enlarged by 2.5x and the other crops by 2x. Its final readout compares only the six pairwise normalized coordinate distances. It uses no UI parser, correctness signal, confidence threshold, teacher-forced scorer, gate, or route.
+The 8B LCR results use its released paired inference prompt, so its full-screen incumbent is not the Direct row above, which uses the default SelectGround prompt. The 30B-A3B configuration uses the default prompt for every view and was verified on both one 80 GB GPU and three 48 GB GPUs.
 
 ## Install
 
