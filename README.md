@@ -18,7 +18,7 @@ The benchmarks contain 1,581 / 3,594 / 510 examples. OSWorld-G uses the target-b
 Use Python 3.12 and CUDA-capable NVIDIA GPUs. Dependencies are pinned to the experimental environment.
 
 ~~~bash
-git clone https://github.com/zhangruotian/SelectGround.git
+git clone --branch paper https://github.com/zhangruotian/SelectGround.git
 cd SelectGround
 python -m venv .venv
 source .venv/bin/activate
