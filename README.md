@@ -39,6 +39,7 @@ python infer.py --image screenshot.png --instruction "Click the Save button" --l
 
 The output **point** is in original-image pixels; **normalized_point** uses 0–1000 coordinates.
 Decoding is greedy with at most 32 tokens and an 8,847,360-pixel image budget.
+For the closest match to the reference scores, use H200 GPUs with the pinned dependencies. GPU-dependent numerical differences can change greedy predictions.
 For LCR, **--benchmark** chooses one of the three fixed comparison-weight presets; the default is **screenspot_pro**.
 
 | Preset | Incumbent proximity | Selector evidence | Candidate agreement |
