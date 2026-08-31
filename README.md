@@ -1,123 +1,154 @@
-# ClickContrast
+# SelectGround
 
-Official **ClickContrast** data, SelectGround checkpoints, and LCR code for **Selection, Not Localization: Observed and Latent Competition in GUI Grounding**.
+Code and assets for **GUI Grounding as Selection under Observed and Latent Competition**.
 
-SelectGround maps a screenshot and instruction to one click. It learns from observed competitors through coordinate supervision and a competitor-aware selection loss. LCR (Latent Competitor Revisit) is its training-free test-time method: it treats the direct click as the incumbent, decodes attention-guided latent competitor views, independently revisits the incumbent at higher resolution, and returns the higher-resolution endpoint of the closest cross-view coordinate pair.
+SelectGround learns from target–distractor pairs with coordinate SFT and an auxiliary attention-based selection loss.
+**Latent Competitor Revisit (LCR)** reuses the trained selector to choose two competitor crops, revisits the initial click, and selects one decoded coordinate using cross-view likelihood, selector evidence, and spatial agreement.
 
-## Results
+| SelectGround-8B | ScreenSpot-Pro | MMBench-GUI L2 | OSWorld-G |
+|---|---:|---:|---:|
+| Direct | 66.034 | 86.283 | 70.196 |
+| + LCR | **73.182** | **88.008** | **71.961** |
 
-| Model | Inference | ScreenSpot-Pro | UI-Vision | OSWorld-G |
-|---|---|---:|---:|---:|
-| SelectGround-8B | Direct | 64.96 | 38.68 | 70.00 |
-| SelectGround-8B | + LCR | **71.22** | **43.02** | **71.96** |
-| SelectGround-30B-A3B | Direct | 65.91 | 38.73 | 72.55 |
-| SelectGround-30B-A3B | + LCR | **74.07** | **46.65** | **76.67** |
-
-UI-Vision is the equal-weight mean of its basic, functional, and spatial element-grounding subsets. OSWorld-G uses the 510 target-bearing examples and excludes 54 refusal examples.
-Both LCR configurations use at most four greedy visual generations. The 8B paper configuration uses the full screenshot, one fixed-budget incumbent crop, and two attention-guided competitor crops. The 30B-A3B configuration uses the full screenshot, one attention-guided competitor crop, and 25% and 40% incumbent-centered crops; the former is enlarged by 2.5x and the other crops by 2x. Its final readout compares only the six pairwise normalized coordinate distances. It uses no UI parser, correctness signal, confidence threshold, teacher-forced scorer, gate, or route.
-The 8B LCR results use its released paired inference prompt, so its full-screen incumbent is not the Direct row above, which uses the default SelectGround prompt. The 30B-A3B configuration uses the default prompt for every view and was verified on both one 80 GB GPU and three 48 GB GPUs.
+The benchmarks contain 1,581 / 3,594 / 510 examples. OSWorld-G uses the target-bearing examples and original instructions.
+[Model](https://huggingface.co/ruotian/SelectGround-8B) · [ClickContrast data](https://huggingface.co/datasets/ruotian/ClickContrast)
 
 ## Install
 
-The training results below were reproduced with Python 3.12, CUDA 12.8, and the pinned packages in `requirements.txt`.
+Use Python 3.12 and CUDA-capable NVIDIA GPUs. Dependencies are pinned to the experimental environment.
 
-```bash
-git clone https://github.com/zhangruotian/ClickContrast.git
-cd ClickContrast
+~~~bash
+git clone https://github.com/zhangruotian/SelectGround.git
+cd SelectGround
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-hf auth login
-```
+python -m unittest test_core
+~~~
 
-The repositories are private during artifact preparation. The same commands work without authentication after release.
+Inference loads the released LoRA adapter and auxiliary selector on Qwen/Qwen3-VL-8B-Instruct, pinned at commit **0c351dd01ed87e9c1b53cbc748cba10e6187ff3b**.
+The model and dataset downloads use their **paper** tags.
+No parser or teacher is needed for training or inference from the released artifacts.
 
-## Ground one screenshot
+## Ground a screenshot
 
-SelectGround direct inference:
+~~~bash
+python infer.py --image screenshot.png --instruction "Click the Save button"
+python infer.py --image screenshot.png --instruction "Click the Save button" --lcr
+~~~
 
-```bash
-python infer.py \
-  --model ruotian/SelectGround-8B \
-  --image screenshot.png \
-  --instruction "Click the Save button"
-```
+The output **point** is in original-image pixels; **normalized_point** uses 0–1000 coordinates.
+Decoding is greedy with at most 32 tokens and an 8,847,360-pixel image budget.
+For LCR, **--benchmark** chooses one of the three fixed comparison-weight presets; the default is **screenspot_pro**.
 
-SelectGround + LCR:
+| Preset | Incumbent proximity | Selector evidence | Candidate agreement |
+|---|---:|---:|---:|
+| screenspot_pro | 0.850 | 0.275 | 0.300 |
+| mmbench_gui_l2 | 0.475 | 1.625 | 0.300 |
+| osworld_g | 0.125 | 0.150 | 0.300 |
 
-```bash
-python infer.py \
-  --model ruotian/SelectGround-8B \
-  --image screenshot.png \
-  --instruction "Click the Save button" \
-  --lcr
-```
+These weights were tuned on the reported benchmarks.
+LCR uses up to four visual grounding passes and additional candidate continuations with cached visual prefixes.
+It returns one decoded point, not an average of points.
 
-Use `--model ruotian/SelectGround-30B-A3B` to run the same LCR inference with the 30B-A3B checkpoint.
+## Download benchmarks
 
-The returned `point` is in source-image pixels; `normalized_point` uses the `[0,1000]` coordinate system.
-
-## Benchmarks
-
-Download the official releases:
-
-```bash
+~~~bash
 hf download lscpku/ScreenSpot-Pro --repo-type dataset --revision 211c2a6b5214b4dc8555a639a47575a9abd48c99 --local-dir data/screenspot-pro
-hf download ServiceNow/ui-vision --repo-type dataset --revision 766c66aeffef16608d4916525902d9fb2598d7ce --local-dir data/ui-vision
+hf download OpenGVLab/MMBench-GUI --repo-type dataset --revision e27757e3910e0d5995b811f916b509b4e34a4690 --include L2_annotations.json MMBench-GUI-OfflineImages.zip --local-dir data/mmbench-gui
+unzip data/mmbench-gui/MMBench-GUI-OfflineImages.zip -d data/mmbench-gui
 git clone https://github.com/xlang-ai/OSWorld-G.git data/OSWorld-G
 git -C data/OSWorld-G checkout daa6bd8e0e629f0917ad2984df930bf0bd967540
-```
+~~~
 
-Run direct inference or append `--lcr`:
+MMBench images must be under **data/mmbench-gui/offline_images/**.
+ScreenSpot-Pro is read directly from its official parquet files.
+Benchmark data remains subject to its respective source terms.
 
-```bash
-python evaluate.py --model ruotian/SelectGround-8B --benchmark screenspot_pro --data data/screenspot-pro --output outputs/ssp.jsonl --lcr
-python evaluate.py --model ruotian/SelectGround-8B --benchmark ui_vision --data data/ui-vision --output outputs/uiv.jsonl --lcr
-python evaluate.py --model ruotian/SelectGround-8B --benchmark osworld_g --data data/OSWorld-G --output outputs/osw.jsonl --lcr
-```
+## Evaluate
 
-The evaluator appends one result at a time and resumes from an existing output file.
+~~~bash
+python evaluate.py --benchmark screenspot_pro --data data/screenspot-pro --output outputs/ssp-direct.jsonl
+python evaluate.py --benchmark mmbench_gui_l2 --data data/mmbench-gui --output outputs/mmb-direct.jsonl
+python evaluate.py --benchmark osworld_g --data data/OSWorld-G --output outputs/osw-direct.jsonl
+~~~
 
-Official benchmark pages: [ScreenSpot-Pro](https://huggingface.co/datasets/lscpku/ScreenSpot-Pro), [UI-Vision](https://huggingface.co/datasets/ServiceNow/ui-vision), and [OSWorld-G](https://github.com/xlang-ai/OSWorld-G/tree/main/benchmark).
+To evaluate LCR, append **--lcr** and use a new output path.
+For example:
 
-## Train
+~~~bash
+python evaluate.py --benchmark screenspot_pro --data data/screenspot-pro --lcr --output outputs/ssp-lcr.jsonl
+~~~
 
-The released [ClickContrast](https://huggingface.co/datasets/ruotian/ClickContrast) dataset contains 4,292 verified model-induced target–competitor pairs with matched coverage grounding examples for replay: 3,790 pairs form the main split and 502 form the final refinement split.
+**--model** accepts a downloaded or locally trained checkpoint directory.
+**--limit 10** runs a smoke test.
+Evaluation writes predictions incrementally and resumes when the same command is repeated.
+Do not mix different checkpoints or inference settings in an output file.
 
-The 8B model was trained on two L40S GPUs. Its two stages must run as separate processes: phase A writes the adapter together with the optimizer, scheduler, and per-rank RNG states; phase B restores those states before using the refinement set. Combining the stages in one process changes gradient accumulation at dataloader boundaries and does not reproduce the model.
+The metrics file reports exact target accuracy and semantic misses.
+A semantic miss is an incorrect on-screen point outside a centered 3x target-width/height neighborhood.
+Both rates divide by all benchmark examples. Invalid outputs remain in the denominator.
 
-```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --mixed_precision bf16 --num_processes 2 train.py \
-  --model 8b --stage phase_a --output outputs/SelectGround-8B-phase-a
+For parallel evaluation, add **--num-shards N --shard I**, with a separate output file and GPU for each shard.
+Then merge the complete shards:
 
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --mixed_precision bf16 --num_processes 2 train.py \
-  --model 8b --stage phase_b --checkpoint outputs/SelectGround-8B-phase-a --output outputs/SelectGround-8B
-```
+~~~bash
+python merge.py --inputs outputs/ssp-lcr-shard-*.jsonl --output outputs/ssp-lcr-full.jsonl
+~~~
 
-The 30B-A3B model was trained in one stage on four 80 GB A100 GPUs:
+The two paper ablations use **--lcr --ablation no_competitors** or **--lcr --ablation no_selector**.
+The first retains only the full-image and incumbent-revisit views.
+The second uses fixed top-left/bottom-right competitor scopes and removes selector evidence.
 
-```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True accelerate launch --mixed_precision bf16 --num_processes 4 train.py --model 30b --output outputs/SelectGround-30B-A3B
-```
+## Reproduce training
 
-Training is standard LoRA SFT. On competitor-paired examples, the loss additionally ranks the target region above the verified distractor and three hard UI regions. Direct inference remains ordinary coordinate decoding, while LCR reconstructs latent competitors in enlarged views and reconsiders the incumbent through cross-view coordinate consistency without additional training.
+Download all 8,584 ClickContrast rows and their screenshots:
 
-With the pinned environment, two independent 8B clean runs reached 64.39 and 64.64 on ScreenSpot-Pro; one was also evaluated at 39.17 on UI-Vision and 69.02 on OSWorld-G. Independent 30B-A3B clean runs reached 64.20--64.83 on ScreenSpot-Pro, 38.57--38.90 on UI-Vision, and 70.98--71.76 on OSWorld-G. Small run-to-run differences remain across GPU nodes because the training kernels are not bitwise deterministic.
+~~~bash
+hf download ruotian/ClickContrast --repo-type dataset --revision paper --local-dir data/clickcontrast
+~~~
 
-## Models and data
+Run the fixed recipe on **two GPUs**, with one example per GPU microbatch and gradient accumulation 64.
+The reference training hardware is two H200 GPUs. Keep the world size and accumulation unchanged.
 
-- [SelectGround-8B](https://huggingface.co/ruotian/SelectGround-8B)
-- [SelectGround-30B-A3B](https://huggingface.co/ruotian/SelectGround-30B-A3B)
-- [ClickContrast](https://huggingface.co/datasets/ruotian/ClickContrast)
+~~~bash
+CUDA_VISIBLE_DEVICES=0,1 bash reproduce.sh data/clickcontrast outputs/reproduction
+~~~
 
-The screenshots in the training repositories are the required subset of [Click-100K](https://huggingface.co/datasets/mlfoundations/Click-100k). Every example retains its upstream split and index.
+The final checkpoint is **outputs/reproduction/final**. Evaluate it by passing that path to **--model**.
 
-## Citation
+| Setting | Initial stage | Refinement |
+|---|---|---|
+| Data | All 4,292 pairs + 4,292 coverage rows | 502 refinement pairs + 502 refinement coverage rows |
+| Coverage / pair microbatch cycle | 1 / 1 | 2 / 1 |
+| Selected updates | 110 | 10 |
+| Adapter learning rate | 3.45e-5 | 1e-6 |
+| Cosine schedule horizon | 320 | 30 |
+| Warmup updates | 10 | 10 |
+| Auxiliary loss weight | 0.10 | 0.05 |
 
-```bibtex
-@article{selectground2026,
-  title={Selection, Not Localization: Observed and Latent Competition in GUI Grounding},
-  author={Anonymous},
-  year={2026}
-}
-```
+Both stages use seed 20260625, LoRA rank 64, alpha 128, dropout 0.05, and selector learning rate 1e-4.
+The coordinate loss applies to every row.
+Paired examples additionally use listwise target ranking over the distractor and up to three disjoint hard regions, plus a softplus pairwise margin of 0.3 with weight 0.5.
+The selector learns weights over decoder layers 18–23 and all heads.
+Only the adapters and selector are optimized; the visual encoder and merger remain frozen.
+
+The reproduction script preserves process boundaries at initial-stage steps 100/110 and refinement steps 5/10.
+Within a stage, it restores optimizer, scheduler, per-rank RNG, and data-stream position.
+Refinement initializes from the initial-stage adapter and selector with a fresh optimizer and schedule.
+The schedule horizons are not replaced by the selected update counts.
+
+Checkpoints include training state so an interrupted segment can be restarted with **--resume** into a new output directory.
+The released model files need only the adapter configuration, adapter weights, and selection head.
+GPU kernels are not bitwise deterministic, so independent training can produce small numerical differences.
+The paper checkpoint was selected using the three benchmarks; this script runs its fixed recipe without another hyperparameter search.
+
+## Files
+
+- **train.py**, **reproduce.sh**: the two-stage SFT + auxiliary-loss recipe.
+- **selectground.py**: pinned model loading, prompt, and greedy coordinate decoding.
+- **lcr.py**: competitor scopes and cross-view candidate selection.
+- **infer.py**, **evaluate.py**, **merge.py**: screenshot inference and benchmark evaluation.
+- **test_core.py**: coordinate, scoring, and LCR unit tests.
+
+Code is Apache-2.0. Screenshot terms are described in the dataset card.
