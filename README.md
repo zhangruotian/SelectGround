@@ -8,7 +8,7 @@ SelectGround is trained on target–distractor pairs with coordinate SFT and an 
 | Direct | 66.034 | 86.283 | 70.196 |
 | + LCR | **73.182** | **88.008** | **71.961** |
 
-[Model](https://huggingface.co/ruotian/SelectGround-8B) · [ClickContrast](https://huggingface.co/datasets/ruotian/ClickContrast)
+[🤗 Model](https://huggingface.co/ruotian/SelectGround-8B) · [🤗 Data](https://huggingface.co/datasets/ruotian/ClickContrast)
 
 ## Install
 
