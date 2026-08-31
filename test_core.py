@@ -45,6 +45,18 @@ class CoreTests(unittest.TestCase):
         result = metrics([{"label": "correct"}, {"label": "others"}])
         self.assertEqual(result["accuracy"], 50.)
 
+    def test_duplicate_responses(self):
+        candidates = [
+            {"name": "p0", "source_view": "full", "point": [20, 20]},
+            {"name": "q0", "source_view": "q0", "point": [20, 20]},
+            {"name": "grid_0", "source_view": "grid_0", "point": [80, 80]},
+        ]
+        values = {"p0": ("[200,200]", -1.), "q0": ("[200,200]", -1.),
+                  "grid_0": ("[800,800]", -5.)}
+        evidence = {name: values for name in ("full", "q0", "grid_0")}
+        best = select(candidates, evidence, dict.fromkeys(values, 0.), (100, 100), (0., 0., 0.))
+        self.assertEqual(best["name"], "p0")
+
 
 if __name__ == "__main__":
     unittest.main()
