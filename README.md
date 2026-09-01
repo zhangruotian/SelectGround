@@ -66,6 +66,8 @@ python infer.py --model "$MODEL" --image screenshot.png --instruction "Click the
 
 ## Reproduce training
 
+The released paper checkpoint predates our fully frozen environment, and its complete low-level execution state—including the exact data order, software and CUDA kernel versions, and distributed operation order—was not preserved, so its exact optimization trajectory cannot be replayed from scratch. We therefore release it for exact paper evaluation and provide a pinned deterministic recipe below that reproduces a new checkpoint byte-for-byte.
+
 Reference training uses **2 NVIDIA H100 GPUs**. Reference evaluation uses **1 NVIDIA H200 GPU**.
 
 ~~~bash
