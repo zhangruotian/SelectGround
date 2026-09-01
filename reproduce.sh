@@ -5,6 +5,10 @@ OUT=${2:?Usage: bash reproduce.sh DATA_DIRECTORY OUTPUT_DIRECTORY}
 export PYTHONHASHSEED=20260625
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NCCL_ALGO=Ring
+export NCCL_PROTO=Simple
 
 accelerate launch --multi_gpu --num_machines 1 --dynamo_backend no --mixed_precision bf16 --num_processes 2 --main_process_port 0 train.py \
   --model 8b --data "$DATA" --gpus 2 --accumulation 64 \

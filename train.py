@@ -440,6 +440,8 @@ def restore(
 
 def main() -> None:
     signal.signal(signal.SIGUSR1, request_preemption)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
     parser = argparse.ArgumentParser(description="Train SelectGround on local paired and replay JSONL files.")
     parser.add_argument("--model", choices=("8b", "30b"), default="8b")
     parser.add_argument("--data", type=Path, required=True)
