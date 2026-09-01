@@ -336,8 +336,6 @@ def restore(
 
 
 def main() -> None:
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
     parser = argparse.ArgumentParser(description="Reproduce SelectGround-8B training.")
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

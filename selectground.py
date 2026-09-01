@@ -1,11 +1,7 @@
 """SelectGround-8B: pinned backbone, coordinate decoding, and LCR."""
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 
 import torch
 from huggingface_hub import snapshot_download
@@ -46,8 +42,6 @@ def prediction(raw, size):
 
 class SelectGround:
     def __init__(self, checkpoint="ruotian/SelectGround-8B"):
-        torch.use_deterministic_algorithms(True)
-        torch.backends.cudnn.benchmark = False
         path = Path(checkpoint)
         if not path.is_dir():
             path = Path(snapshot_download(checkpoint, revision="paper"))
