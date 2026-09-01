@@ -3,23 +3,26 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import random
+import os
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
-import numpy as np
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+os.environ["NCCL_ALGO"] = "Ring"
+os.environ["NCCL_PROTO"] = "Simple"
+
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
-from peft import LoraConfig, PeftModel, get_peft_model
+from peft import LoraConfig, get_peft_model
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, get_scheduler
 
 from selectground import PROMPT
-
 
 BASE_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
@@ -71,21 +74,6 @@ def _attention_logits(
     visual_keys = key_states.index_select(2, positions)
     logits = (query.unsqueeze(2) * visual_keys).sum(dim=-1) * float(getattr(attention, "scaling", 1.0))
     return logits.squeeze(0)
-
-
-def load_visual_merger(model: Any, checkpoint: Path) -> None:
-    merger_path = checkpoint / "visual_merger.pt"
-    if not merger_path.is_file():
-        raise FileNotFoundError(f"Missing visual merger checkpoint: {merger_path}")
-    merger = torch.load(merger_path, map_location="cpu", weights_only=False)
-    parameters = dict(model.named_parameters())
-    state = merger.get("state_dict", merger)
-    missing = sorted(set(state) - set(parameters))
-    if missing:
-        raise KeyError(f"Visual merger parameters missing from model: {missing[:3]}")
-    with torch.no_grad():
-        for name, value in state.items():
-            parameters[name].copy_(value.to(parameters[name].device, parameters[name].dtype))
 
 
 class Rows(Dataset):
@@ -263,13 +251,8 @@ def save(
     accelerator: Accelerator,
     model: Any,
     selector: Any,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
     processor: Any,
     output: Path,
-    completed: int,
-    stage: str,
-    micro_step: int,
 ) -> None:
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -284,73 +267,20 @@ def save(
         torch.save({"state_dict": merger}, output / "visual_merger.pt")
         head = accelerator.unwrap_model(selector)
         torch.save({"layers": LAYERS, "layer_head_weights": head.layer_head_weights.detach().cpu()}, output / "selection_head.pt")
-        torch.save(
-            {
-                "completed": completed,
-                "micro_step": micro_step,
-                "stage": stage,
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-            },
-            output / "training_state.pt",
-        )
         processor.save_pretrained(output)
-    accelerator.wait_for_everyone()
-    rng = {
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-        "torch": torch.get_rng_state(),
-        "cuda": torch.cuda.get_rng_state_all(),
-    }
-    torch.save(rng, output / f"rng_state_rank_{accelerator.process_index}.pt")
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         (output / "checkpoint_complete").write_text("complete\n", encoding="utf-8")
     accelerator.wait_for_everyone()
 
 
-def restore(
-    checkpoint: Path,
-    optimizer: torch.optim.Optimizer,
-    scheduler: Any,
-    accelerator: Accelerator,
-    stage: str,
-    accumulation: int,
-) -> tuple[int, int]:
-    state = torch.load(checkpoint / "training_state.pt", map_location="cpu", weights_only=False)
-    optimizer.load_state_dict(state["optimizer"])
-    scheduler.load_state_dict(state["scheduler"])
-    rng = torch.load(
-        checkpoint / f"rng_state_rank_{accelerator.process_index}.pt",
-        map_location="cpu",
-        weights_only=False,
-    )
-    random.setstate(rng["python"])
-    np.random.set_state(rng["numpy"])
-    torch.set_rng_state(rng["torch"])
-    torch.cuda.set_rng_state_all(rng["cuda"])
-    completed = int(state["completed"])
-    saved_stage = state.get("stage")
-    micro_step = int(state.get("micro_step", completed * accumulation)) if saved_stage == stage else 0
-    return completed, micro_step
-
-
 def main() -> None:
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
     parser = argparse.ArgumentParser(description="Reproduce SelectGround-8B training.")
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--initialize-from", type=Path)
-    parser.add_argument("--stage", choices=("main", "refinement"), default="main")
-    parser.add_argument("--steps", type=int, required=True)
     args = parser.parse_args()
-    if args.checkpoint is not None and args.initialize_from is not None:
-        raise ValueError("Use only one of --checkpoint and --initialize-from")
-    learning_rate, auxiliary_weight, pair_every, scheduler_steps = (
-        (3.45e-5, .1, 2, 320)
-        if args.stage == "main"
-        else (1e-6, .05, 3, 30)
-    )
     accelerator = Accelerator(
         gradient_accumulation_steps=64,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False)],
@@ -359,16 +289,10 @@ def main() -> None:
         raise ValueError(f"Expected 2 processes, got {accelerator.num_processes}")
     set_seed(SEED + accelerator.process_index)
     data = args.data
-    pair_file, replay_file = (
-        ("all_pairs.jsonl", "all_replay.jsonl")
-        if args.stage == "main"
-        else ("refinement_pairs.jsonl", "refinement_replay.jsonl")
-    )
-    pairs = read_rows(data / "data" / pair_file)
-    replay = read_rows(data / "data" / replay_file)
-    seed_offset = 1000 if args.stage == "main" else 3000
-    pair_seed, replay_seed = SEED + seed_offset + 1, SEED + seed_offset + 1001
-    pair_loader, replay_loader = loader(pairs, data, pair_seed), loader(replay, data, replay_seed)
+    pairs = read_rows(data / "data" / "all_pairs.jsonl")
+    replay = read_rows(data / "data" / "all_replay.jsonl")
+    pair_loader = loader(pairs, data, SEED + 1001)
+    replay_loader = loader(replay, data, SEED + 2001)
 
     processor = AutoProcessor.from_pretrained(
         BASE_MODEL, revision=BASE_REVISION, min_pixels=3136, max_pixels=8847360
@@ -378,18 +302,13 @@ def main() -> None:
         BASE_MODEL, revision=BASE_REVISION, config=base_config,
         dtype=torch.bfloat16, attn_implementation="sdpa"
     )
-    source_checkpoint = args.checkpoint or args.initialize_from
-    if source_checkpoint is None:
-        model = get_peft_model(model, LoraConfig(
-            r=64,
-            lora_alpha=128,
-            lora_dropout=.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            task_type="CAUSAL_LM",
-        ))
-    else:
-        model = PeftModel.from_pretrained(model, source_checkpoint, is_trainable=True)
-        load_visual_merger(model, source_checkpoint)
+    model = get_peft_model(model, LoraConfig(
+        r=64,
+        lora_alpha=128,
+        lora_dropout=.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        task_type="CAUSAL_LM",
+    ))
     for parameter in model.parameters():
         if parameter.requires_grad:
             parameter.data = parameter.data.to(torch.bfloat16)
@@ -399,36 +318,23 @@ def main() -> None:
     config = _find_config(model)
     heads = int(_value(_value(config, "text_config", config), "num_attention_heads"))
     selector = HeadSelector(heads)
-    if source_checkpoint is not None:
-        head = torch.load(source_checkpoint / "selection_head.pt", map_location="cpu", weights_only=False)
-        selector.layer_head_weights.data.copy_(head["layer_head_weights"])
     optimizer = torch.optim.AdamW([
-        {"params": [parameter for parameter in model.parameters() if parameter.requires_grad], "lr": learning_rate},
+        {"params": [parameter for parameter in model.parameters() if parameter.requires_grad], "lr": 3.45e-5},
         {"params": selector.parameters(), "lr": 1e-4},
     ], weight_decay=0.0)
-    scheduler = scheduler_for(optimizer, 10, scheduler_steps)
+    scheduler = scheduler_for(optimizer, 10, 320)
     model, selector, optimizer, pair_loader, replay_loader = accelerator.prepare(
         model, selector, optimizer, pair_loader, replay_loader
     )
     model.train()
     selector.train()
     iterators = [iter(pair_loader), iter(replay_loader)]
-    completed, micro_step = (
-        restore(args.checkpoint, optimizer, scheduler, accelerator, args.stage, 64)
-        if args.checkpoint
-        else (0, 0)
-    )
-    if micro_step:
-        for skipped in range(micro_step):
-            index = 0 if skipped % pair_every == pair_every - 1 else 1
-            _, iterators[index] = next_row((pair_loader, replay_loader)[index], iterators[index])
-    target = args.steps
+    completed = micro_step = 0
     optimizer.zero_grad(set_to_none=True)
-    while completed < target:
-        active_loaders, active_iterators = (pair_loader, replay_loader), iterators
-        competitor_paired = micro_step % pair_every == pair_every - 1
+    while completed < 90:
+        competitor_paired = micro_step % 2 == 1
         index = 0 if competitor_paired else 1
-        row, active_iterators[index] = next_row(active_loaders[index], active_iterators[index])
+        row, iterators[index] = next_row((pair_loader, replay_loader)[index], iterators[index])
         with accelerator.accumulate(model, selector):
             inputs, labels, query = encode(processor, row, accelerator.device)
             visual = torch.nonzero(inputs["input_ids"][0] == int(_value(config, "image_token_id")), as_tuple=False).flatten()
@@ -449,7 +355,7 @@ def main() -> None:
                 else:
                     selection_term = output.logits.sum() * 0
                 coord_loss = coordinate_loss(output.logits, inputs["input_ids"], labels)
-                loss = coord_loss + auxiliary_weight * selection_term
+                loss = coord_loss + .2 * selection_term
                 accelerator.backward(loss)
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(list(model.parameters()) + list(selector.parameters()), 1.0)
@@ -461,22 +367,13 @@ def main() -> None:
             completed += 1
             if accelerator.is_main_process:
                 print(f"step={completed} loss={float(loss):.4f} coord={float(coord_loss):.4f} selection={float(selection_term):.4f}", flush=True)
-    save(
-        accelerator,
-        model,
-        selector,
-        optimizer,
-        scheduler,
-        processor,
-        args.output,
-        completed,
-        args.stage,
-        micro_step,
-    )
+    save(accelerator, model, selector, processor, args.output)
     if accelerator.is_main_process:
         run_config = vars(args) | {
             "base_model": BASE_MODEL,
             "base_revision": BASE_REVISION,
+            "steps": completed,
+            "seed": SEED,
         }
         (args.output / "run_config.json").write_text(
             json.dumps(run_config, default=str, indent=2, sort_keys=True) + "\n",

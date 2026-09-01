@@ -34,7 +34,7 @@ hf download ruotian/ClickContrast --repo-type dataset --revision paper --max-wor
 CUDA_VISIBLE_DEVICES=0,1 bash reproduce.sh data/clickcontrast outputs/reproduction
 ~~~
 
-The reproduced checkpoint is written to **outputs/reproduction/final**.
+The reproduced checkpoint is written to **outputs/reproduction**.
 
 ## Download benchmarks
 
@@ -59,7 +59,7 @@ MODEL=ruotian/SelectGround-8B
 To evaluate a reproduced checkpoint instead:
 
 ~~~bash
-MODEL=outputs/reproduction/final
+MODEL=outputs/reproduction
 ~~~
 
 Run all three Direct evaluations:
