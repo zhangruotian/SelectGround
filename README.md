@@ -3,7 +3,7 @@
 Code and assets for **GUI Grounding as Selection under Observed and Latent Competition**.
 SelectGround is trained on target–distractor pairs with coordinate SFT and an auxiliary selection loss. Latent Competitor Revisit (LCR) revisits likely competitor regions at inference time.
 
-| SelectGround-8B | ScreenSpot-Pro | MMBench-GUI L2 | OSWorld-G |
+| Released SelectGround-8B | ScreenSpot-Pro | MMBench-GUI L2 | OSWorld-G |
 |---|---:|---:|---:|
 | Direct | 66.034 | 86.283 | 70.196 |
 | + LCR | **73.182** | **88.008** | **71.961** |
@@ -20,21 +20,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ~~~
 
-## Inference
+## Download the model
 
 ~~~bash
-python infer.py --image screenshot.png --instruction "Click the Save button"
-python infer.py --image screenshot.png --instruction "Click the Save button" --lcr
+hf download ruotian/SelectGround-8B --revision paper --local-dir models/SelectGround-8B
+MODEL=models/SelectGround-8B
 ~~~
-
-## Reproduce training
-
-~~~bash
-hf download ruotian/ClickContrast --repo-type dataset --revision paper --local-dir data/clickcontrast
-CUDA_VISIBLE_DEVICES=0,1 bash reproduce.sh data/clickcontrast outputs/reproduction
-~~~
-
-The reproduced checkpoint is written to **outputs/reproduction**.
 
 ## Download benchmarks
 
@@ -49,18 +40,6 @@ git -C data/OSWorld-G checkout daa6bd8e0e629f0917ad2984df930bf0bd967540
 ~~~
 
 ## Evaluate Direct and LCR
-
-Use the released model:
-
-~~~bash
-MODEL=ruotian/SelectGround-8B
-~~~
-
-To evaluate a reproduced checkpoint instead:
-
-~~~bash
-MODEL=outputs/reproduction
-~~~
 
 Run all three Direct evaluations:
 
@@ -77,5 +56,23 @@ python evaluate.py --model "$MODEL" --benchmark screenspot_pro --data data/scree
 python evaluate.py --model "$MODEL" --benchmark mmbench_gui_l2 --data data/mmbench-gui --lcr --output outputs/mmb-lcr.jsonl
 python evaluate.py --model "$MODEL" --benchmark osworld_g --data data/OSWorld-G --lcr --output outputs/osw-lcr.jsonl
 ~~~
+
+## Single-image inference
+
+~~~bash
+python infer.py --model "$MODEL" --image screenshot.png --instruction "Click the Save button"
+python infer.py --model "$MODEL" --image screenshot.png --instruction "Click the Save button" --lcr
+~~~
+
+## Reproduce training
+
+Reference training uses **2 NVIDIA H100 GPUs**. Reference evaluation uses **1 NVIDIA H200 GPU**.
+
+~~~bash
+hf download ruotian/ClickContrast --repo-type dataset --revision paper --local-dir data/clickcontrast
+CUDA_VISIBLE_DEVICES=0,1 bash reproduce.sh data/clickcontrast outputs/reproduction
+~~~
+
+The reproduced checkpoint is written to **outputs/reproduction**. Its reference H200 results are `65.528 / 85.671 / 69.804` with Direct inference and `71.917 / 87.730 / 71.961` with LCR on ScreenSpot-Pro, MMBench-GUI L2, and OSWorld-G, respectively.
 
 Code is Apache-2.0. Screenshot terms are described in the dataset card.
