@@ -30,7 +30,7 @@ python infer.py --image screenshot.png --instruction "Click the Save button" --l
 ## Reproduce training
 
 ~~~bash
-hf download ruotian/ClickContrast --repo-type dataset --revision paper --max-workers 1 --local-dir data/clickcontrast
+hf download ruotian/ClickContrast --repo-type dataset --revision paper --local-dir data/clickcontrast
 CUDA_VISIBLE_DEVICES=0,1 bash reproduce.sh data/clickcontrast outputs/reproduction
 ~~~
 
