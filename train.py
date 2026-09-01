@@ -4,9 +4,6 @@ import argparse
 import json
 import math
 import random
-import signal
-import shutil
-import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -24,45 +21,10 @@ from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor,
 from selectground import PROMPT
 
 
-RECIPES = {
-    "8b": {
-        "base": "Qwen/Qwen3-VL-8B-Instruct",
-        "revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
-        "data": "ruotian/ClickContrast",
-        "steps": 135,
-        "gpus": 2,
-        "accumulation": 64,
-        "learning_rate": 5e-5,
-    },
-    "30b": {
-        "base": "Qwen/Qwen3-VL-30B-A3B-Instruct",
-        "revision": "9c4b90e1e4ba969fd3b5378b57d966d725f1b86c",
-        "data": "ruotian/ClickContrast",
-        "steps": 200,
-        "gpus": 4,
-        "accumulation": 4,
-        "learning_rate": 4e-5,
-    },
-}
+BASE_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
+BASE_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 LAYERS = list(range(18, 24))
 SEED = 20260625
-PREEMPT_REQUESTED = False
-
-
-def request_preemption(_signum: int, _frame: Any) -> None:
-    global PREEMPT_REQUESTED
-    PREEMPT_REQUESTED = True
-
-
-def replace_with_retry(source: Path, destination: Path, attempts: int = 5) -> None:
-    for attempt in range(attempts):
-        try:
-            source.replace(destination)
-            return
-        except OSError:
-            if attempt + 1 == attempts:
-                raise
-            time.sleep(2 ** attempt)
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
@@ -183,14 +145,6 @@ def read_rows(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def stage_files(stage: str) -> tuple[str, str]:
-    if stage == "main":
-        return "train_pairs.jsonl", "train_replay.jsonl"
-    if stage == "refinement":
-        return "refinement_pairs.jsonl", "refinement_replay.jsonl"
-    raise ValueError(f"Unknown training stage: {stage}")
-
-
 def loader(rows: list[dict[str, Any]], root: Path, seed: int) -> DataLoader:
     return DataLoader(
         Rows(rows, root),
@@ -245,11 +199,6 @@ def coordinate_loss(logits: torch.Tensor, input_ids: torch.Tensor, labels: torch
     return -(token_logps * mask).sum().to(logits.dtype) / mask.sum()
 
 
-def coordinate_weight(row: dict[str, Any], ground_weight: float) -> float:
-    component = str(row.get("source_ref", {}).get("component") or "")
-    return ground_weight if component.startswith("ground_") else 1.0
-
-
 def box_mask(box: list[float], row: dict[str, Any], grid: torch.Tensor, config: Any) -> torch.Tensor:
     vision = _value(config, "vision_config")
     patch, merge = int(_value(vision, "patch_size", 16)), int(_value(vision, "spatial_merge_size", 2))
@@ -302,14 +251,6 @@ def selection_loss(
     return listwise + pair_weight * pair
 
 
-def warmup_cosine(step: int, warmup: int, total: int) -> float:
-    if step < warmup:
-        return step / warmup
-    if step >= total:
-        return 0.0
-    return .5 * (1 + math.cos(math.pi * (step - warmup) / (total - warmup)))
-
-
 def scheduler_for(optimizer: torch.optim.Optimizer, warmup_steps: int, training_steps: int):
     return get_scheduler(
         "cosine",
@@ -317,34 +258,6 @@ def scheduler_for(optimizer: torch.optim.Optimizer, warmup_steps: int, training_
         num_warmup_steps=warmup_steps,
         num_training_steps=training_steps,
     )
-
-
-def paper_scheduler_for(
-    optimizer: torch.optim.Optimizer,
-    phase_a_steps: int,
-    phase_a_warmup_steps: int,
-    phase_a_scheduler_steps: int,
-    phase_b_warmup_steps: int,
-    phase_b_scheduler_steps: int,
-    phase_b_learning_rate: float,
-    phase_b_selector_learning_rate: float,
-):
-    base_lrs = [group["lr"] for group in optimizer.param_groups]
-    target_lrs = [phase_b_learning_rate, phase_b_selector_learning_rate]
-    functions = []
-    for base, target in zip(base_lrs, target_lrs):
-        def schedule(step: int, base=base, target=target):
-            if step < phase_a_steps + 1:
-                return warmup_cosine(step, phase_a_warmup_steps, phase_a_scheduler_steps)
-            return target / base * warmup_cosine(
-                step - phase_a_steps,
-                phase_b_warmup_steps,
-                phase_b_scheduler_steps,
-            )
-
-        functions.append(schedule)
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, functions)
-
 
 def save(
     accelerator: Accelerator,
@@ -354,29 +267,23 @@ def save(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     processor: Any,
     output: Path,
-    revision: str,
     completed: int,
     stage: str,
     micro_step: int,
 ) -> None:
-    atomic = output.name.startswith("step-")
-    target = output.with_name(f"{output.name}.incomplete") if atomic else output
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        if atomic and target.exists():
-            shutil.rmtree(target)
-        target.mkdir(parents=True, exist_ok=True)
-        (target / "checkpoint_complete").unlink(missing_ok=True)
+        output.mkdir(parents=True, exist_ok=True)
         unwrapped = accelerator.unwrap_model(model)
-        unwrapped.save_pretrained(target, safe_serialization=True)
-        config_path = target / "adapter_config.json"
+        unwrapped.save_pretrained(output, safe_serialization=True)
+        config_path = output / "adapter_config.json"
         config = json.loads(config_path.read_text())
-        config["revision"] = revision
+        config["revision"] = BASE_REVISION
         config_path.write_text(json.dumps(config, indent=2) + "\n")
         merger = {name: value.detach().cpu() for name, value in unwrapped.named_parameters() if ".visual.merger." in f".{name}"}
-        torch.save({"state_dict": merger}, target / "visual_merger.pt")
+        torch.save({"state_dict": merger}, output / "visual_merger.pt")
         head = accelerator.unwrap_model(selector)
-        torch.save({"layers": LAYERS, "layer_head_weights": head.layer_head_weights.detach().cpu()}, target / "selection_head.pt")
+        torch.save({"layers": LAYERS, "layer_head_weights": head.layer_head_weights.detach().cpu()}, output / "selection_head.pt")
         torch.save(
             {
                 "completed": completed,
@@ -385,9 +292,9 @@ def save(
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
             },
-            target / "training_state.pt",
+            output / "training_state.pt",
         )
-        processor.save_pretrained(target)
+        processor.save_pretrained(output)
     accelerator.wait_for_everyone()
     rng = {
         "python": random.getstate(),
@@ -395,20 +302,10 @@ def save(
         "torch": torch.get_rng_state(),
         "cuda": torch.cuda.get_rng_state_all(),
     }
-    torch.save(rng, target / f"rng_state_rank_{accelerator.process_index}.pt")
+    torch.save(rng, output / f"rng_state_rank_{accelerator.process_index}.pt")
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        (target / "checkpoint_complete").write_text("complete\n", encoding="utf-8")
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process and atomic:
-        if output.exists():
-            shutil.rmtree(output)
-        replace_with_retry(target, output)
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process and atomic:
-        for previous in output.parent.glob("step-*"):
-            if previous != output and (previous / "checkpoint_complete").is_file():
-                shutil.rmtree(previous)
+        (output / "checkpoint_complete").write_text("complete\n", encoding="utf-8")
     accelerator.wait_for_everyone()
 
 
@@ -439,76 +336,48 @@ def restore(
 
 
 def main() -> None:
-    signal.signal(signal.SIGUSR1, request_preemption)
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.benchmark = False
-    parser = argparse.ArgumentParser(description="Train SelectGround on local paired and replay JSONL files.")
-    parser.add_argument("--model", choices=("8b", "30b"), default="8b")
+    parser = argparse.ArgumentParser(description="Reproduce SelectGround-8B training.")
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--initialize-from", type=Path)
     parser.add_argument("--stage", choices=("main", "refinement"), default="main")
-    parser.add_argument("--pairs-file", type=Path)
-    parser.add_argument("--replay-file", type=Path)
     parser.add_argument("--steps", type=int, required=True)
-    parser.add_argument("--gpus", type=int, default=4)
-    parser.add_argument("--accumulation", type=int, default=32)
-    parser.add_argument("--learning-rate", type=float, default=5e-5)
-    parser.add_argument("--selector-learning-rate", type=float, default=1e-4)
-    parser.add_argument("--aux-weight", type=float, default=0.1)
-    parser.add_argument("--ground-coordinate-weight", type=float, default=1.0)
-    parser.add_argument("--margin", type=float, default=0.3)
-    parser.add_argument("--pair-weight", type=float, default=0.5)
-    parser.add_argument("--pair-every", type=int, default=2)
-    parser.add_argument("--warmup-steps", type=int, default=10)
-    parser.add_argument("--scheduler-steps", type=int)
-    parser.add_argument("--paper-two-stage", action="store_true")
-    parser.add_argument("--phase-a-steps", type=int)
-    parser.add_argument("--phase-b-warmup-steps", type=int, default=10)
-    parser.add_argument("--phase-b-scheduler-steps", type=int, default=25)
-    parser.add_argument("--phase-b-learning-rate", type=float, default=1e-6)
-    parser.add_argument("--phase-b-selector-learning-rate", type=float, default=1e-4)
-    parser.add_argument("--holdout-fraction", type=float, default=0.0)
-    parser.add_argument("--max-pixels", type=int, default=8847360)
-    parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--save-every", type=int, default=25)
     args = parser.parse_args()
     if args.checkpoint is not None and args.initialize_from is not None:
         raise ValueError("Use only one of --checkpoint and --initialize-from")
-    if (args.pairs_file is None) != (args.replay_file is None):
-        raise ValueError("--pairs-file and --replay-file must be used together")
-    if args.paper_two_stage and args.phase_a_steps is None:
-        raise ValueError("--paper-two-stage requires --phase-a-steps")
-    if args.pair_every < 2:
-        raise ValueError("--pair-every must be at least 2")
-    recipe = RECIPES[args.model]
+    learning_rate, auxiliary_weight, pair_every, scheduler_steps = (
+        (3.45e-5, .1, 2, 320)
+        if args.stage == "main"
+        else (1e-6, .05, 3, 30)
+    )
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.accumulation,
+        gradient_accumulation_steps=64,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False)],
     )
-    if accelerator.num_processes != args.gpus:
-        raise ValueError(f"Expected {args.gpus} processes, got {accelerator.num_processes}")
-    set_seed(args.seed + accelerator.process_index)
+    if accelerator.num_processes != 2:
+        raise ValueError(f"Expected 2 processes, got {accelerator.num_processes}")
+    set_seed(SEED + accelerator.process_index)
     data = args.data
-    pair_file, replay_file = stage_files(args.stage)
-    pairs_path = args.pairs_file or data / "data" / pair_file
-    replay_path = args.replay_file or data / "data" / replay_file
-    pairs = read_rows(pairs_path)
-    replay = read_rows(replay_path)
-    if args.stage == "main" and args.holdout_fraction > 0:
-        random.Random(args.seed).shuffle(pairs)
-        pairs = pairs[max(1, round(args.holdout_fraction * len(pairs))) :]
+    pair_file, replay_file = (
+        ("all_pairs.jsonl", "all_replay.jsonl")
+        if args.stage == "main"
+        else ("refinement_pairs.jsonl", "refinement_replay.jsonl")
+    )
+    pairs = read_rows(data / "data" / pair_file)
+    replay = read_rows(data / "data" / replay_file)
     seed_offset = 1000 if args.stage == "main" else 3000
-    pair_seed, replay_seed = args.seed + seed_offset + 1, args.seed + seed_offset + 1001
+    pair_seed, replay_seed = SEED + seed_offset + 1, SEED + seed_offset + 1001
     pair_loader, replay_loader = loader(pairs, data, pair_seed), loader(replay, data, replay_seed)
 
     processor = AutoProcessor.from_pretrained(
-        recipe["base"], revision=recipe["revision"], min_pixels=3136, max_pixels=args.max_pixels
+        BASE_MODEL, revision=BASE_REVISION, min_pixels=3136, max_pixels=8847360
     )
-    base_config = AutoConfig.from_pretrained(recipe["base"], revision=recipe["revision"])
+    base_config = AutoConfig.from_pretrained(BASE_MODEL, revision=BASE_REVISION)
     model = AutoModelForImageTextToText.from_pretrained(
-        recipe["base"], revision=recipe["revision"], config=base_config,
+        BASE_MODEL, revision=BASE_REVISION, config=base_config,
         dtype=torch.bfloat16, attn_implementation="sdpa"
     )
     source_checkpoint = args.checkpoint or args.initialize_from
@@ -521,10 +390,6 @@ def main() -> None:
             task_type="CAUSAL_LM",
         ))
     else:
-        import transformers.integrations.tensor_parallel as tensor_parallel
-
-        if not hasattr(tensor_parallel, "EmbeddingParallel"):
-            tensor_parallel.EmbeddingParallel = type("EmbeddingParallel", (), {})
         model = PeftModel.from_pretrained(model, source_checkpoint, is_trainable=True)
         load_visual_merger(model, source_checkpoint)
     for parameter in model.parameters():
@@ -540,22 +405,10 @@ def main() -> None:
         head = torch.load(source_checkpoint / "selection_head.pt", map_location="cpu", weights_only=False)
         selector.layer_head_weights.data.copy_(head["layer_head_weights"])
     optimizer = torch.optim.AdamW([
-        {"params": [parameter for parameter in model.parameters() if parameter.requires_grad], "lr": args.learning_rate},
-        {"params": selector.parameters(), "lr": args.selector_learning_rate},
+        {"params": [parameter for parameter in model.parameters() if parameter.requires_grad], "lr": learning_rate},
+        {"params": selector.parameters(), "lr": 1e-4},
     ], weight_decay=0.0)
-    if args.paper_two_stage:
-        scheduler = paper_scheduler_for(
-            optimizer,
-            phase_a_steps=args.phase_a_steps,
-            phase_a_warmup_steps=args.warmup_steps,
-            phase_a_scheduler_steps=args.scheduler_steps or args.steps,
-            phase_b_warmup_steps=args.phase_b_warmup_steps,
-            phase_b_scheduler_steps=args.phase_b_scheduler_steps,
-            phase_b_learning_rate=args.phase_b_learning_rate,
-            phase_b_selector_learning_rate=args.phase_b_selector_learning_rate,
-        )
-    else:
-        scheduler = scheduler_for(optimizer, args.warmup_steps, args.scheduler_steps or args.steps)
+    scheduler = scheduler_for(optimizer, 10, scheduler_steps)
     model, selector, optimizer, pair_loader, replay_loader = accelerator.prepare(
         model, selector, optimizer, pair_loader, replay_loader
     )
@@ -563,19 +416,19 @@ def main() -> None:
     selector.train()
     iterators = [iter(pair_loader), iter(replay_loader)]
     completed, micro_step = (
-        restore(args.checkpoint, optimizer, scheduler, accelerator, args.stage, args.accumulation)
+        restore(args.checkpoint, optimizer, scheduler, accelerator, args.stage, 64)
         if args.checkpoint
         else (0, 0)
     )
     if micro_step:
         for skipped in range(micro_step):
-            index = 0 if skipped % args.pair_every == args.pair_every - 1 else 1
+            index = 0 if skipped % pair_every == pair_every - 1 else 1
             _, iterators[index] = next_row((pair_loader, replay_loader)[index], iterators[index])
     target = args.steps
     optimizer.zero_grad(set_to_none=True)
     while completed < target:
         active_loaders, active_iterators = (pair_loader, replay_loader), iterators
-        competitor_paired = micro_step % args.pair_every == args.pair_every - 1
+        competitor_paired = micro_step % pair_every == pair_every - 1
         index = 0 if competitor_paired else 1
         row, active_iterators[index] = next_row(active_loaders[index], active_iterators[index])
         with accelerator.accumulate(model, selector):
@@ -592,14 +445,13 @@ def main() -> None:
                         row,
                         inputs["image_grid_thw"][0],
                         config,
-                        margin=args.margin,
-                        pair_weight=args.pair_weight,
+                        margin=.3,
+                        pair_weight=.5,
                     )
                 else:
                     selection_term = output.logits.sum() * 0
                 coord_loss = coordinate_loss(output.logits, inputs["input_ids"], labels)
-                coord_scale = coordinate_weight(row, args.ground_coordinate_weight)
-                loss = coord_scale * coord_loss + args.aux_weight * selection_term
+                loss = coord_loss + auxiliary_weight * selection_term
                 accelerator.backward(loss)
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(list(model.parameters()) + list(selector.parameters()), 1.0)
@@ -610,36 +462,7 @@ def main() -> None:
         if accelerator.sync_gradients:
             completed += 1
             if accelerator.is_main_process:
-                print(f"step={completed} loss={float(loss):.4f} coord={float(coord_loss):.4f} coord_scale={coord_scale:.2f} selection={float(selection_term):.4f}", flush=True)
-            if args.save_every > 0 and completed < target and completed % args.save_every == 0:
-                save(
-                    accelerator,
-                    model,
-                    selector,
-                    optimizer,
-                    scheduler,
-                    processor,
-                    args.output / "checkpoints" / f"step-{completed}",
-                    recipe["revision"],
-                    completed,
-                    args.stage,
-                    micro_step,
-                )
-            if PREEMPT_REQUESTED:
-                save(
-                    accelerator,
-                    model,
-                    selector,
-                    optimizer,
-                    scheduler,
-                    processor,
-                    args.output / "checkpoints" / f"step-{completed}",
-                    recipe["revision"],
-                    completed,
-                    args.stage,
-                    micro_step,
-                )
-                raise SystemExit(85)
+                print(f"step={completed} loss={float(loss):.4f} coord={float(coord_loss):.4f} selection={float(selection_term):.4f}", flush=True)
     save(
         accelerator,
         model,
@@ -648,15 +471,14 @@ def main() -> None:
         scheduler,
         processor,
         args.output,
-        recipe["revision"],
         completed,
         args.stage,
         micro_step,
     )
     if accelerator.is_main_process:
         run_config = vars(args) | {
-            "base_model": recipe["base"],
-            "base_revision": recipe["revision"],
+            "base_model": BASE_MODEL,
+            "base_revision": BASE_REVISION,
         }
         (args.output / "run_config.json").write_text(
             json.dumps(run_config, default=str, indent=2, sort_keys=True) + "\n",

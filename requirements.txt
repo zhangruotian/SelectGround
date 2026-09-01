@@ -3,7 +3,7 @@
 accelerate==1.13.0
 huggingface-hub==0.36.2
 numpy==2.1.1
-peft==0.19.1
+peft==0.18.1
 Pillow==12.2.0
 pyarrow==24.0.0
 qwen-vl-utils==0.0.14
