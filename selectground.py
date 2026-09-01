@@ -49,7 +49,13 @@ class SelectGround:
             BASE_MODEL, revision=BASE_REVISION, dtype=torch.bfloat16,
             device_map="auto", attn_implementation="sdpa",
         )
-        self.model = PeftModel.from_pretrained(base, path).eval()
+        self.model = PeftModel.from_pretrained(base, path)
+        merger = torch.load(path / "visual_merger.pt", map_location="cpu", weights_only=True)
+        parameters = dict(self.model.named_parameters())
+        with torch.no_grad():
+            for name, value in merger["state_dict"].items():
+                parameters[name].copy_(value.to(parameters[name].device, parameters[name].dtype))
+        self.model.eval()
         self.model.config.use_cache = True
         self.processor = AutoProcessor.from_pretrained(
             BASE_MODEL, revision=BASE_REVISION, min_pixels=3136, max_pixels=8847360,
